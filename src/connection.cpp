@@ -25,7 +25,8 @@ Connection::Connection(int client_fd) noexcept : client_fd_(client_fd) {}
 Connection::Connection(Connection&& other) noexcept
     : client_fd_(std::exchange(other.client_fd_, -1)),
       valid_(std::exchange(other.valid_, false)),
-      input_buffer_(std::move(other.input_buffer_)) {}
+      input_buffer_(std::move(other.input_buffer_)),
+      http_parser_(std::move(other.http_parser_)) {}
 
 // 先释放当前资源，再从 other 接管连接状态。
 Connection& Connection::operator=(Connection&& other) noexcept {
@@ -37,6 +38,7 @@ Connection& Connection::operator=(Connection&& other) noexcept {
     client_fd_ = std::exchange(other.client_fd_, -1);
     valid_ = std::exchange(other.valid_, false);
     input_buffer_ = std::move(other.input_buffer_);
+    http_parser_ = std::move(other.http_parser_);
     return *this;
 }
 
@@ -78,6 +80,11 @@ const std::vector<char>& Connection::inputBuffer() const noexcept {
     return input_buffer_;
 }
 
+// 返回与此连接生命周期一致的增量 Parser。
+HttpParser& Connection::httpParser() noexcept {
+    return http_parser_;
+}
+
 // 读取当前所有可用字节，并将其追加到持久输入缓冲区。
 Connection::ReadStatus Connection::readAvailableData() {
     // read_buffer 临时保存一次 recv 返回的数据。
@@ -91,6 +98,17 @@ Connection::ReadStatus Connection::readAvailableData() {
         if (bytes_received > 0) {
             // chunk_size 是转换为容器索引类型后的本次数据长度。
             const auto chunk_size = static_cast<std::size_t>(bytes_received);
+            if (input_buffer_.size() >
+                    HttpParser::kMaxBufferedRequestSize ||
+                chunk_size >
+                    HttpParser::kMaxBufferedRequestSize -
+                        input_buffer_.size()) {
+                valid_ = false;
+                std::cerr << "input buffer limit exceeded for fd="
+                          << client_fd_ << std::endl;
+                return ReadStatus::kError;
+            }
+
             input_buffer_.insert(input_buffer_.end(), read_buffer.data(),
                                  read_buffer.data() + chunk_size);
 

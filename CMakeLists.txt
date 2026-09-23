@@ -12,6 +12,7 @@ endif()
 
 add_executable(faststore
     src/connection.cpp
+    src/http.cpp
     src/main.cpp
     src/server.cpp
 )
@@ -33,3 +34,25 @@ target_compile_options(faststore PRIVATE
 target_compile_definitions(faststore PRIVATE
     FASTSTORE_DATA_DIRECTORY="${PROJECT_SOURCE_DIR}/data"
 )
+
+enable_testing()
+
+add_executable(http_parser_test
+    tests/http_parser_test.cpp
+    src/http.cpp
+)
+
+target_compile_features(http_parser_test PRIVATE cxx_std_17)
+target_include_directories(http_parser_test PRIVATE
+    "${PROJECT_SOURCE_DIR}/include"
+)
+set_target_properties(http_parser_test PROPERTIES
+    CXX_EXTENSIONS OFF
+)
+target_compile_options(http_parser_test PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+)
+
+add_test(NAME http_parser_test COMMAND http_parser_test)

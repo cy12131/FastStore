@@ -8,7 +8,7 @@ V0 将实现基于 epoll 的最小 HTTP 文件服务器，并支持通过 PUT、
 
 ## 当前阶段
 
-当前开发 Milestone 2：Server 负责 epoll 事件分发，每个 Connection 独立拥有客户端 fd 并累计保存收到的数据。当前不包含 HTTP 解析或文件传输功能。
+当前开发 Milestone 3：Connection 累计网络字节，增量 Parser 将其解析为 HTTP/1.1 HttpRequest。当前不包含 HTTP Response、路由或文件操作。
 
 ## 构建
 
@@ -30,3 +30,7 @@ cmake --build .
 ```
 
 程序启动后持续运行，可使用 `Ctrl+C` 结束。
+
+## M3 内存说明
+
+M3 为验证增量 Parser，会把完整 PUT body 保存在 Connection 输入缓冲区和 HttpRequest 中，最大 body 为 64 MiB。这是临时设计；M4 文件写入阶段应改为流式消费 body，避免大文件完整驻留内存。

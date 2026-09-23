@@ -238,6 +238,39 @@ void Server::handleClientEvent(Connection& connection, std::uint32_t events) {
             closeClient(client_fd);
             return;
         }
+
+        // Parser 只读取 Connection 已累计的数据，不执行任何网络操作。
+        HttpParser& parser = connection.httpParser();
+        const ParseStatus parse_status =
+            parser.parse(connection.inputBuffer());
+
+        if (parse_status == ParseStatus::kIncomplete) {
+            std::cout << "Parser incomplete: fd=" << client_fd
+                      << ", buffered=" << connection.inputBuffer().size()
+                      << " bytes" << std::endl;
+        } else if (parse_status == ParseStatus::kError) {
+            std::cerr << "HTTP parse error: fd=" << client_fd
+                      << ": " << parser.errorMessage() << std::endl;
+            closeClient(client_fd);
+            return;
+        } else {
+            const HttpRequest* request = parser.request();
+            if (request == nullptr) {
+                std::cerr << "HTTP parser completed without a request: fd="
+                          << client_fd << std::endl;
+                closeClient(client_fd);
+                return;
+            }
+
+            std::cout << "Parsed request:" << std::endl
+                      << "method=" << toString(request->method) << std::endl
+                      << "target=" << request->target << std::endl
+                      << "content_length=" << request->content_length
+                      << std::endl
+                      << "body_size=" << request->body.size() << std::endl;
+            closeClient(client_fd);
+            return;
+        }
     }
 
     if ((events & EPOLLERR) != 0U) {

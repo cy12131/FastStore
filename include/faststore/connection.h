@@ -1,6 +1,8 @@
 #ifndef FASTSTORE_CONNECTION_H
 #define FASTSTORE_CONNECTION_H
 
+#include "faststore/http.h"
+
 #include <vector>
 
 namespace faststore {
@@ -35,8 +37,11 @@ public:
     // 返回最近一次读取后连接是否仍然有效。
     [[nodiscard]] bool isValid() const noexcept;
 
-    // 返回累计保存的客户端输入字节，供后续 HTTP Parser 使用。
+    // 返回累计保存的客户端输入字节。
     [[nodiscard]] const std::vector<char>& inputBuffer() const noexcept;
+
+    // 返回属于当前连接的增量 HTTP Parser。
+    [[nodiscard]] HttpParser& httpParser() noexcept;
 
     // 循环 recv 到 EAGAIN、EOF 或真正错误，并保存所有读取到的数据。
     ReadStatus readAvailableData();
@@ -46,8 +51,9 @@ private:
     void closeClientFd() noexcept;
 
     int client_fd_;                 // 当前 Connection 独占的客户端 fd。
-    bool valid_{true};              // 连接是否仍可继续处理。
-    std::vector<char> input_buffer_; // 跨多次 epoll 事件累计的输入字节。
+    bool valid_{true};               // 连接是否仍可继续处理。
+    std::vector<char> input_buffer_;  // 跨多次 epoll 事件累计的输入字节。
+    HttpParser http_parser_;          // 当前连接的增量 HTTP 解析状态。
 };
 
 }  // namespace faststore
