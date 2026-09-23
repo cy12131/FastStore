@@ -12,6 +12,7 @@ endif()
 
 add_executable(faststore
     src/connection.cpp
+    src/file_service.cpp
     src/http.cpp
     src/main.cpp
     src/server.cpp
@@ -56,3 +57,23 @@ target_compile_options(http_parser_test PRIVATE
 )
 
 add_test(NAME http_parser_test COMMAND http_parser_test)
+
+add_executable(file_service_test
+    tests/file_service_test.cpp
+    src/file_service.cpp
+)
+
+target_compile_features(file_service_test PRIVATE cxx_std_17)
+target_include_directories(file_service_test PRIVATE
+    "${PROJECT_SOURCE_DIR}/include"
+)
+set_target_properties(file_service_test PROPERTIES
+    CXX_EXTENSIONS OFF
+)
+target_compile_options(file_service_test PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+)
+
+add_test(NAME file_service_test COMMAND file_service_test)

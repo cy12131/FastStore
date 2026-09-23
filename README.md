@@ -8,7 +8,7 @@ V0 将实现基于 epoll 的最小 HTTP 文件服务器，并支持通过 PUT、
 
 ## 当前阶段
 
-当前开发 Milestone 3：Connection 累计网络字节，增量 Parser 将其解析为 HTTP/1.1 HttpRequest。当前不包含 HTTP Response、路由或文件操作。
+当前开发 Milestone 4-A：独立 FileService 使用 Linux directory fd 和 `*at` 系统调用安全访问 `data/`。当前尚未把 HTTP Request 映射到文件操作，也不包含 HTTP Response。
 
 ## 构建
 
