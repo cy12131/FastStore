@@ -1,11 +1,17 @@
+#include "faststore/server.h"
+
 #include <cstdlib>
+#include <cstdint>
 #include <filesystem>
 #include <iostream>
+#include <stdexcept>
 #include <string_view>
 #include <system_error>
 
 namespace {
 
+// 输出 data 目录初始化错误并返回进程失败状态。
+// path 是发生错误的目录，message 描述操作，error 保存系统错误码。
 int report_data_directory_error(const std::filesystem::path& path,
                                 std::string_view message,
                                 const std::error_code& error = {}) {
@@ -20,13 +26,21 @@ int report_data_directory_error(const std::filesystem::path& path,
 
 }  // namespace
 
+// 程序入口：准备 data 目录，然后创建并启动 TCP Server。
 int main() {
+    // port 是 M1 阶段固定使用的 TCP 监听端口。
+    constexpr std::uint16_t port = 8080;
+
+    // data_directory 是构建时配置的文件数据目录绝对路径。
     const std::filesystem::path data_directory{FASTSTORE_DATA_DIRECTORY};
 
-    std::cout << "FastStore V0 starting\n";
+    std::cout << "FastStore starting\n";
     std::cout << "Data directory: " << data_directory << '\n';
 
+    // error 接收 filesystem API 的错误，避免异常中断初始化流程。
     std::error_code error;
+
+    // exists 表示配置的数据路径当前是否已经存在。
     const bool exists = std::filesystem::exists(data_directory, error);
     if (error) {
         return report_data_directory_error(
@@ -45,6 +59,15 @@ int main() {
             data_directory, "data path is not a directory", error);
     }
 
-    std::cout << "FastStore initialization complete\n";
+    try {
+        // server 唯一持有监听 socket、epoll fd 和所有客户端 fd。
+        faststore::Server server{port};
+        server.run();
+    } catch (const std::exception& error) {
+        // error 保存 Server 初始化或事件循环抛出的异常信息。
+        std::cerr << "FastStore server failed: " << error.what() << '\n';
+        return EXIT_FAILURE;
+    }
+
     return EXIT_SUCCESS;
 }

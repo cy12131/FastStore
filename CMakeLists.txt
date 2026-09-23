@@ -12,9 +12,13 @@ endif()
 
 add_executable(faststore
     src/main.cpp
+    src/server.cpp
 )
 
 target_compile_features(faststore PRIVATE cxx_std_17)
+target_include_directories(faststore PRIVATE
+    "${PROJECT_SOURCE_DIR}/include"
+)
 set_target_properties(faststore PROPERTIES
     CXX_EXTENSIONS OFF
 )
