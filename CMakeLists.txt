@@ -1,0 +1,30 @@
+cmake_minimum_required(VERSION 3.16)
+
+project(FastStore VERSION 0.1.0 LANGUAGES CXX)
+
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "FastStore currently supports Linux only")
+endif()
+
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
+endif()
+
+add_executable(faststore
+    src/main.cpp
+)
+
+target_compile_features(faststore PRIVATE cxx_std_17)
+set_target_properties(faststore PROPERTIES
+    CXX_EXTENSIONS OFF
+)
+
+target_compile_options(faststore PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+)
+
+target_compile_definitions(faststore PRIVATE
+    FASTSTORE_DATA_DIRECTORY="${PROJECT_SOURCE_DIR}/data"
+)
