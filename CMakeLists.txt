@@ -11,6 +11,7 @@ if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
 endif()
 
 add_executable(faststore
+    src/connection.cpp
     src/main.cpp
     src/server.cpp
 )

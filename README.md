@@ -8,7 +8,7 @@ V0 将实现基于 epoll 的最小 HTTP 文件服务器，并支持通过 PUT、
 
 ## 当前阶段
 
-当前开发 Milestone 1：程序初始化 `data/` 目录，并在 `0.0.0.0:8080` 上运行基于 epoll 的非阻塞 TCP 事件循环。当前只记录连接和接收字节数，不包含 HTTP 解析或文件传输功能。
+当前开发 Milestone 2：Server 负责 epoll 事件分发，每个 Connection 独立拥有客户端 fd 并累计保存收到的数据。当前不包含 HTTP 解析或文件传输功能。
 
 ## 构建
 

@@ -1,22 +1,24 @@
 #ifndef FASTSTORE_SERVER_H
 #define FASTSTORE_SERVER_H
 
+#include "faststore/connection.h"
+
 #include <cstdint>
-#include <unordered_set>
+#include <unordered_map>
 
 namespace faststore {
 
-// 管理 M1 阶段的监听 socket、epoll 实例和所有客户端 fd。
+// 管理监听 socket、epoll 实例以及所有 Connection 的生命周期。
 class Server {
 public:
     // 创建服务器对象并保存监听端口；此时尚未创建任何系统资源。
     // port 表示服务器要监听的 TCP 端口。
     explicit Server(std::uint16_t port);
 
-    // 关闭仍由服务器持有的客户端、监听 socket 和 epoll fd。
+    // 销毁所有 Connection，并关闭监听 socket 和 epoll fd。
     ~Server();
 
-    // fd 具有唯一所有权，因此服务器对象不可复制或移动。
+    // fd 和 Connection 具有唯一所有权，因此 Server 不可复制或移动。
     Server(const Server&) = delete;
     Server& operator=(const Server&) = delete;
     Server(Server&&) = delete;
@@ -35,22 +37,20 @@ private:
     // 循环接收所有待处理连接，直到 accept4 返回 EAGAIN。
     void acceptConnections();
 
-    // 处理一个客户端的 epoll 事件。
-    // client_fd 是产生事件的客户端 fd，events 是 epoll 返回的事件位集合。
-    void handleClientEvent(int client_fd, std::uint32_t events);
+    // 将一个客户端事件分发给对应的 Connection。
+    // connection 是事件对应的状态对象，events 是 epoll 事件位集合。
+    void handleClientEvent(Connection& connection, std::uint32_t events);
 
-    // 循环读取客户端数据，直到读空、断开或发生错误。
-    // client_fd 是待读取的客户端 fd；返回 true 表示连接仍可保留。
-    bool receiveClientData(int client_fd);
-
-    // 将客户端从 epoll 和 fd 集合移除，然后关闭其 fd。
+    // 从 epoll 删除客户端，再销毁拥有该 fd 的 Connection。
     // client_fd 是需要清理的客户端 fd。
     void closeClient(int client_fd);
 
-    std::uint16_t port_;                 // 服务器监听的主机字节序端口。
-    int listening_fd_{-1};               // 接收新连接的非阻塞 socket fd。
-    int epoll_fd_{-1};                   // epoll 实例的文件描述符。
-    std::unordered_set<int> client_fds_; // 当前由服务器持有的客户端 fd。
+    std::uint16_t port_; // 服务器监听的主机字节序端口。
+    int listening_fd_{-1}; // 接收新连接的非阻塞 socket fd。
+    int epoll_fd_{-1}; // epoll 实例的文件描述符。
+
+    // 以客户端 fd 为键，按值拥有每个不可复制但可安全移动的 Connection。
+    std::unordered_map<int, Connection> connections_;
 };
 
 }  // namespace faststore

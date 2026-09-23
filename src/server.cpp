@@ -12,6 +12,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <system_error>
+#include <utility>
 
 namespace faststore {
 namespace {
@@ -22,15 +23,12 @@ constexpr int kListenBacklog = SOMAXCONN;
 // kMaxEvents 是一次 epoll_wait 最多取出的就绪事件数量。
 constexpr std::size_t kMaxEvents = 64;
 
-// kReadBufferSize 是每次 recv 使用的栈缓冲区容量。
-constexpr std::size_t kReadBufferSize = 8192;
-
 // 根据当前 errno 抛出 system_error；operation 表示失败的系统调用。
 [[noreturn]] void throwSystemError(const char* operation) {
     throw std::system_error(errno, std::generic_category(), operation);
 }
 
-// 关闭一个有效 fd，并在失败时记录错误。
+// 关闭 Server 自身拥有的监听或 epoll fd。
 // fd 是待关闭的文件描述符，description 用于标识日志中的资源类型。
 void closeFileDescriptor(int fd, const char* description) noexcept {
     if (fd < 0) {
@@ -50,13 +48,10 @@ void closeFileDescriptor(int fd, const char* description) noexcept {
 // 保存监听端口；socket 和 epoll 资源延迟到 run() 中创建。
 Server::Server(std::uint16_t port) : port_(port) {}
 
-// 释放仍由 Server 持有的全部文件描述符。
+// 先销毁所有 Connection，再释放 Server 自身拥有的系统资源。
 Server::~Server() {
-    // client_fd 依次表示析构时仍处于打开状态的客户端连接。
-    for (const int client_fd : client_fds_) {
-        closeFileDescriptor(client_fd, "client");
-    }
-    client_fds_.clear();
+    // 清空容器会调用每个 Connection 的析构函数并关闭对应客户端 fd。
+    connections_.clear();
 
     closeFileDescriptor(listening_fd_, "listening socket");
     closeFileDescriptor(epoll_fd_, "epoll");
@@ -104,8 +99,10 @@ void Server::run() {
                 continue;
             }
 
-            if (client_fds_.find(fd) != client_fds_.end()) {
-                handleClientEvent(fd, event.events);
+            // connection_it 将客户端 fd 映射到唯一的 Connection。
+            const auto connection_it = connections_.find(fd);
+            if (connection_it != connections_.end()) {
+                handleClientEvent(connection_it->second, event.events);
             }
         }
     }
@@ -187,14 +184,17 @@ void Server::acceptConnections() {
             return;
         }
 
-        try {
-            client_fds_.insert(client_fd);
-        } catch (...) {
-            closeFileDescriptor(client_fd, "untracked client");
-            throw;
+        // connection 立即接管 client_fd；异常退出时也会自动关闭它。
+        Connection connection{client_fd};
+
+        // connection_inserted 表示唯一所有权是否已移动到 map 中。
+        const bool connection_inserted =
+            connections_.try_emplace(client_fd, std::move(connection)).second;
+        if (!connection_inserted) {
+            throw std::logic_error("accepted duplicate client fd");
         }
 
-        // event 描述客户端需要关注的可读和对端半关闭事件。
+        // 从此处开始，client_fd 由容器内的 Connection 唯一拥有。
         epoll_event event{};
         event.events = EPOLLIN | EPOLLRDHUP;
         event.data.fd = client_fd;
@@ -203,8 +203,9 @@ void Server::acceptConnections() {
             const int error = errno;
             std::cerr << "Failed to register client fd=" << client_fd
                       << " with epoll: " << std::strerror(error) << std::endl;
-            client_fds_.erase(client_fd);
-            closeFileDescriptor(client_fd, "unregistered client");
+
+            // erase 销毁 Connection，由其析构函数关闭 client_fd。
+            connections_.erase(client_fd);
             continue;
         }
 
@@ -223,11 +224,20 @@ void Server::acceptConnections() {
     }
 }
 
-// 处理客户端可读、错误、挂断和半关闭事件。
-void Server::handleClientEvent(int client_fd, std::uint32_t events) {
-    if ((events & EPOLLIN) != 0U && !receiveClientData(client_fd)) {
-        closeClient(client_fd);
-        return;
+// 将客户端事件交给对应 Connection，并处理 epoll 异常状态。
+void Server::handleClientEvent(Connection& connection, std::uint32_t events) {
+    // client_fd 在销毁 Connection 前保存，用于 epoll 操作和日志。
+    const int client_fd = connection.fd();
+
+    if ((events & EPOLLIN) != 0U) {
+        // read_status 区分暂时读空、对端关闭和真正读取错误。
+        const Connection::ReadStatus read_status =
+            connection.readAvailableData();
+        if (read_status != Connection::ReadStatus::kOpen ||
+            !connection.isValid()) {
+            closeClient(client_fd);
+            return;
+        }
     }
 
     if ((events & EPOLLERR) != 0U) {
@@ -251,44 +261,11 @@ void Server::handleClientEvent(int client_fd, std::uint32_t events) {
     }
 }
 
-// 将客户端当前可读的数据全部读取；数据内容在 M1 阶段直接丢弃。
-bool Server::receiveClientData(int client_fd) {
-    // buffer 是每次 recv 临时存放数据的固定大小缓冲区。
-    std::array<char, kReadBufferSize> buffer{};
-
-    while (true) {
-        // bytes_received 是本次 recv 实际读取的字节数。
-        const ssize_t bytes_received =
-            ::recv(client_fd, buffer.data(), buffer.size(), 0);
-
-        if (bytes_received > 0) {
-            std::cout << "Received " << bytes_received
-                      << " bytes from fd=" << client_fd << std::endl;
-            continue;
-        }
-
-        if (bytes_received == 0) {
-            return false;
-        }
-
-        if (errno == EINTR) {
-            continue;
-        }
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            return true;
-        }
-
-        // error 保存 recv 失败时的 errno。
-        const int error = errno;
-        std::cerr << "recv failed for fd=" << client_fd << ": "
-                  << std::strerror(error) << std::endl;
-        return false;
-    }
-}
-
-// 统一注销并关闭一个客户端 fd；重复清理会被安全忽略。
+// 先从 epoll 删除客户端，再销毁拥有该 fd 的 Connection。
 void Server::closeClient(int client_fd) {
-    if (client_fds_.erase(client_fd) == 0U) {
+    // connection_it 在 erase 前定位 Connection；erase 后不可再解引用。
+    const auto connection_it = connections_.find(client_fd);
+    if (connection_it == connections_.end()) {
         return;
     }
 
@@ -300,7 +277,8 @@ void Server::closeClient(int client_fd) {
                   << " from epoll: " << std::strerror(error) << std::endl;
     }
 
-    closeFileDescriptor(client_fd, "client");
+    // 销毁 Connection；其析构函数在这里关闭 client_fd。
+    connections_.erase(connection_it);
     std::cout << "Connection closed: fd=" << client_fd << std::endl;
 }
 
