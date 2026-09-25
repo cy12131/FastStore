@@ -129,3 +129,27 @@ target_compile_options(http_response_test PRIVATE
 )
 
 add_test(NAME http_response_test COMMAND http_response_test)
+
+add_executable(get_streaming_test
+    tests/get_streaming_test.cpp
+    src/connection.cpp
+    src/file_service.cpp
+    src/http.cpp
+    src/http_response.cpp
+    src/router.cpp
+)
+
+target_compile_features(get_streaming_test PRIVATE cxx_std_17)
+target_include_directories(get_streaming_test PRIVATE
+    "${PROJECT_SOURCE_DIR}/include"
+)
+set_target_properties(get_streaming_test PROPERTIES
+    CXX_EXTENSIONS OFF
+)
+target_compile_options(get_streaming_test PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+)
+
+add_test(NAME get_streaming_test COMMAND get_streaming_test)

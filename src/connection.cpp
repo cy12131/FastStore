@@ -30,6 +30,15 @@ Connection::Connection(Connection&& other) noexcept
       received_body_bytes_(std::exchange(other.received_body_bytes_, 0)),
       response_buffer_(std::move(other.response_buffer_)),
       response_offset_(std::exchange(other.response_offset_, 0)),
+      read_file_(std::move(other.read_file_)),
+      file_buffer_(std::move(other.file_buffer_)),
+      file_chunk_valid_size_(
+          std::exchange(other.file_chunk_valid_size_, 0)),
+      file_chunk_send_offset_(
+          std::exchange(other.file_chunk_send_offset_, 0)),
+      expected_file_bytes_(std::exchange(other.expected_file_bytes_, 0)),
+      loaded_file_bytes_(std::exchange(other.loaded_file_bytes_, 0)),
+      sent_file_bytes_(std::exchange(other.sent_file_bytes_, 0)),
       error_message_(std::move(other.error_message_)) {}
 
 Connection& Connection::operator=(Connection&& other) noexcept {
@@ -51,6 +60,15 @@ Connection& Connection::operator=(Connection&& other) noexcept {
     received_body_bytes_ = std::exchange(other.received_body_bytes_, 0);
     response_buffer_ = std::move(other.response_buffer_);
     response_offset_ = std::exchange(other.response_offset_, 0);
+    read_file_ = std::move(other.read_file_);
+    file_buffer_ = std::move(other.file_buffer_);
+    file_chunk_valid_size_ =
+        std::exchange(other.file_chunk_valid_size_, 0);
+    file_chunk_send_offset_ =
+        std::exchange(other.file_chunk_send_offset_, 0);
+    expected_file_bytes_ = std::exchange(other.expected_file_bytes_, 0);
+    loaded_file_bytes_ = std::exchange(other.loaded_file_bytes_, 0);
+    sent_file_bytes_ = std::exchange(other.sent_file_bytes_, 0);
     error_message_ = std::move(other.error_message_);
     return *this;
 }
@@ -92,7 +110,8 @@ bool Connection::wantsRead() const noexcept {
 }
 
 bool Connection::wantsWrite() const noexcept {
-    return state_ == State::kWritingResponse;
+    return state_ == State::kWritingResponse ||
+           state_ == State::kWritingFileBody;
 }
 
 std::size_t Connection::readableSize() const noexcept {
@@ -113,6 +132,30 @@ std::size_t Connection::responseOffset() const noexcept {
 
 std::size_t Connection::responseSize() const noexcept {
     return response_buffer_.size();
+}
+
+std::size_t Connection::fileBufferCapacity() const noexcept {
+    return file_buffer_.size();
+}
+
+std::size_t Connection::fileChunkValidSize() const noexcept {
+    return file_chunk_valid_size_;
+}
+
+std::size_t Connection::fileChunkSendOffset() const noexcept {
+    return file_chunk_send_offset_;
+}
+
+std::uint64_t Connection::expectedFileBytes() const noexcept {
+    return expected_file_bytes_;
+}
+
+std::uint64_t Connection::sentFileBytes() const noexcept {
+    return sent_file_bytes_;
+}
+
+bool Connection::hasOpenReadFile() const noexcept {
+    return read_file_.has_value();
 }
 
 const HttpRequest* Connection::request() const noexcept {
@@ -203,7 +246,7 @@ bool Connection::processBufferedInput(FileService& file_service) {
             // The method is syntactically valid but unsupported. Respond 405
             // immediately and close after sending; an unsupported body is not
             // consumed or interpreted as another request.
-            prepareResponse(routeRequest(file_service, *parsed_request));
+            prepareRouteResult(routeRequest(file_service, *parsed_request));
             return true;
         }
         if (parsed_request->method != HttpMethod::kPut) {
@@ -267,6 +310,7 @@ bool Connection::processBufferedInput(FileService& file_service) {
 bool Connection::finalizeAtReadBoundary(FileService& file_service,
                                         bool peer_eof) {
     if (state_ == State::kWritingResponse ||
+        state_ == State::kWritingFileBody ||
         state_ == State::kResponseComplete) {
         return true;
     }
@@ -278,7 +322,7 @@ bool Connection::finalizeAtReadBoundary(FileService& file_service,
         return true;
     }
     if (state_ == State::kRequestReady) {
-        prepareResponse(routeRequest(file_service, *http_parser_.request()));
+        prepareRouteResult(routeRequest(file_service, *http_parser_.request()));
         return true;
     }
     if (state_ != State::kReceivingBody) {
@@ -307,17 +351,37 @@ bool Connection::finalizeAtReadBoundary(FileService& file_service,
     }
 
     upload_.reset();
-    prepareResponse(routeRequest(file_service, *http_parser_.request()));
+    prepareRouteResult(routeRequest(file_service, *http_parser_.request()));
     return true;
 }
 
 void Connection::prepareResponse(HttpResponse response) {
     upload_.reset();
+    read_file_.reset();
+    file_buffer_.clear();
+    file_chunk_valid_size_ = 0;
+    file_chunk_send_offset_ = 0;
+    expected_file_bytes_ = 0;
+    loaded_file_bytes_ = 0;
+    sent_file_bytes_ = 0;
     input_buffer_.clear();
     read_offset_ = 0;
     response_buffer_ = serializeHttpResponse(response);
     response_offset_ = 0;
     state_ = State::kWritingResponse;
+}
+
+void Connection::prepareRouteResult(RouteResult result) {
+    prepareResponse(std::move(result.response));
+    if (!result.read_file.has_value()) {
+        return;
+    }
+
+    read_file_ = std::move(result.read_file);
+    expected_file_bytes_ = read_file_->size();
+    if (expected_file_bytes_ > 0U) {
+        file_buffer_.resize(kFileChunkSize);
+    }
 }
 
 void Connection::prepareBadRequest() {
@@ -328,6 +392,8 @@ void Connection::failTransport(std::string message) {
     state_ = State::kError;
     valid_ = false;
     upload_.reset();
+    read_file_.reset();
+    file_buffer_.clear();
     error_message_ = std::move(message);
 }
 
@@ -383,16 +449,60 @@ Connection::ReadStatus Connection::readAvailableData(
 
 Connection::WriteStatus Connection::writeAvailableData() {
     if (!wantsWrite()) {
-        failTransport("send requested without a pending response");
+        failTransport("send requested without pending output");
         return WriteStatus::kError;
     }
 
-    while (response_offset_ < response_buffer_.size()) {
+    if (state_ == State::kWritingResponse) {
+        while (response_offset_ < response_buffer_.size()) {
+            const ssize_t sent = ::send(
+                client_fd_, response_buffer_.data() + response_offset_,
+                response_buffer_.size() - response_offset_, MSG_NOSIGNAL);
+            if (sent > 0) {
+                response_offset_ += static_cast<std::size_t>(sent);
+                continue;
+            }
+            if (sent == -1 && errno == EINTR) {
+                continue;
+            }
+            if (sent == -1 &&
+                (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                return WriteStatus::kPending;
+            }
+
+            const int error = sent == 0 ? EIO : errno;
+            failTransport(std::string{"send failed: "} +
+                          std::strerror(error));
+            return WriteStatus::kError;
+        }
+
+        if (!read_file_.has_value() || expected_file_bytes_ == 0U) {
+            read_file_.reset();
+            file_buffer_.clear();
+            state_ = State::kResponseComplete;
+            return WriteStatus::kComplete;
+        }
+        state_ = State::kWritingFileBody;
+    }
+
+    return writeFileBody();
+}
+
+Connection::WriteStatus Connection::writeFileBody() {
+    while (sent_file_bytes_ < expected_file_bytes_) {
+        if (file_chunk_send_offset_ == file_chunk_valid_size_) {
+            if (!loadNextFileChunk()) {
+                return WriteStatus::kError;
+            }
+        }
+
         const ssize_t sent = ::send(
-            client_fd_, response_buffer_.data() + response_offset_,
-            response_buffer_.size() - response_offset_, MSG_NOSIGNAL);
+            client_fd_, file_buffer_.data() + file_chunk_send_offset_,
+            file_chunk_valid_size_ - file_chunk_send_offset_, MSG_NOSIGNAL);
         if (sent > 0) {
-            response_offset_ += static_cast<std::size_t>(sent);
+            const auto sent_size = static_cast<std::size_t>(sent);
+            file_chunk_send_offset_ += sent_size;
+            sent_file_bytes_ += static_cast<std::uint64_t>(sent_size);
             continue;
         }
         if (sent == -1 && errno == EINTR) {
@@ -403,12 +513,57 @@ Connection::WriteStatus Connection::writeAvailableData() {
         }
 
         const int error = sent == 0 ? EIO : errno;
-        failTransport(std::string{"send failed: "} + std::strerror(error));
+        failTransport(std::string{"file body send failed: "} +
+                      std::strerror(error));
         return WriteStatus::kError;
     }
 
+    read_file_.reset();
+    file_buffer_.clear();
+    file_chunk_valid_size_ = 0;
+    file_chunk_send_offset_ = 0;
     state_ = State::kResponseComplete;
     return WriteStatus::kComplete;
+}
+
+bool Connection::loadNextFileChunk() {
+    if (!read_file_.has_value() ||
+        file_chunk_send_offset_ != file_chunk_valid_size_) {
+        failTransport("invalid file streaming state");
+        return false;
+    }
+
+    const std::uint64_t remaining =
+        expected_file_bytes_ - loaded_file_bytes_;
+    const std::size_t to_read = static_cast<std::size_t>(
+        std::min<std::uint64_t>(file_buffer_.size(), remaining));
+    if (to_read == 0U) {
+        failTransport("file body ended before Content-Length was sent");
+        return false;
+    }
+
+    while (true) {
+        const ssize_t count =
+            ::read(read_file_->fd(), file_buffer_.data(), to_read);
+        if (count > 0) {
+            file_chunk_valid_size_ = static_cast<std::size_t>(count);
+            file_chunk_send_offset_ = 0;
+            loaded_file_bytes_ += static_cast<std::uint64_t>(count);
+            return true;
+        }
+        if (count == -1 && errno == EINTR) {
+            continue;
+        }
+        if (count == 0) {
+            failTransport("file was truncated during streaming GET");
+            return false;
+        }
+
+        const int error = errno;
+        failTransport(std::string{"file read failed: "} +
+                      std::strerror(error));
+        return false;
+    }
 }
 
 }  // namespace faststore

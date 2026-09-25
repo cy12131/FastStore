@@ -293,7 +293,7 @@ void testDeleteExistingAndMissing() {
                      "HTTP/1.1 404 Not Found\r\n");
 }
 
-void testRoutingErrorsAndGetPolicy() {
+void testRoutingErrors() {
     Harness invalid;
     invalid.readRequest(
         "HEAD /files/a/b HTTP/1.1\r\nHost: localhost\r\n\r\n");
@@ -322,11 +322,6 @@ void testRoutingErrorsAndGetPolicy() {
     expectStatusLine(too_large.sendPreparedResponse(),
                      "HTTP/1.1 413 Payload Too Large\r\n");
 
-    Harness get;
-    get.readRequest(
-        "GET /files/a.txt HTTP/1.1\r\nHost: localhost\r\n\r\n");
-    expectStatusLine(get.sendPreparedResponse(),
-                     "HTTP/1.1 501 Not Implemented\r\n");
 }
 
 void testNotRegularIsHiddenAsNotFound() {
@@ -422,7 +417,7 @@ int main() {
         {"PUT created", testPutCreated},
         {"HEAD existing and missing", testHeadExistingAndMissing},
         {"DELETE existing and missing", testDeleteExistingAndMissing},
-        {"routing errors and GET policy", testRoutingErrorsAndGetPolicy},
+        {"routing errors", testRoutingErrors},
         {"non-regular hidden as not found", testNotRegularIsHiddenAsNotFound},
         {"peer half-close response", testPeerHalfCloseStillGetsResponse},
         {"send EAGAIN preserves offset", testSendEagainPreservesOffset},

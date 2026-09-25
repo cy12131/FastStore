@@ -21,7 +21,7 @@ enum class HttpStatus : unsigned int {
     kNotImplemented = 501
 };
 
-// M5-A 的小型、完整缓冲 HTTP response；GET 文件体不由此实现。
+// 小型 HTTP response；GET 仅在此保存 headers，文件体由 Connection 流式发送。
 struct HttpResponse {
     HttpStatus status{HttpStatus::kInternalServerError};
     std::uint64_t content_length{0};
