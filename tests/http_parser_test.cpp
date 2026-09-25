@@ -6,7 +6,6 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <utility>
 #include <vector>
 
 namespace {
@@ -18,6 +17,10 @@ using faststore::ParseStatus;
 
 std::vector<char> bytes(std::string_view text) {
     return {text.begin(), text.end()};
+}
+
+std::string_view view(const std::vector<char>& input) {
+    return {input.data(), input.size()};
 }
 
 void append(std::vector<char>& destination, std::string_view text) {
@@ -34,106 +37,100 @@ void expectStatus(HttpParser& parser,
                   const std::vector<char>& input,
                   ParseStatus expected,
                   std::string_view message) {
-    expect(parser.parse(input) == expected, message);
+    expect(parser.parse(view(input)) == expected, message);
 }
 
 void expectError(std::string_view request) {
     HttpParser parser;
-    expectStatus(parser, bytes(request), ParseStatus::kError,
-                 "expected parse error");
+    expect(parser.parse(request) == ParseStatus::kError,
+           "expected parse error");
     expect(!parser.errorMessage().empty(),
            "parse error must include a message");
 }
 
-void testNormalGet() {
+void testPartialAndCompleteGetHeaders() {
     HttpParser parser;
-    const auto input =
-        bytes("GET /files/test.txt HTTP/1.1\r\n"
-              "Host: localhost\r\n\r\n");
+    auto input = bytes("GET /files/test.txt HTTP/1.1\r\nHo");
+    expectStatus(parser, input, ParseStatus::kIncomplete,
+                 "partial GET headers must be incomplete");
 
-    expectStatus(parser, input, ParseStatus::kComplete,
-                 "GET should complete");
+    append(input, "st: localhost\r\n\r\n");
+    expectStatus(parser, input, ParseStatus::kHeadersComplete,
+                 "complete GET headers were not reported");
     const HttpRequest* request = parser.request();
-    expect(request != nullptr, "GET request is missing");
+    expect(request != nullptr, "GET metadata is missing");
     expect(request->method == HttpMethod::kGet, "wrong GET method");
     expect(request->target == "/files/test.txt", "wrong GET target");
     expect(request->version == "HTTP/1.1", "wrong HTTP version");
     expect(request->content_length == 0U, "wrong GET length");
-    expect(request->body.empty(), "GET body must be empty");
+    expect(parser.consumedBytes() == input.size(),
+           "GET header byte count is wrong");
 }
 
-void testNormalPutAndHeaderNormalization() {
+void testPutMetadataWithoutBodyCopy() {
     HttpParser parser;
-    const auto input =
-        bytes("PUT /files/test.txt HTTP/1.1\r\n"
-              "hOsT:\tlocalhost \t\r\n"
-              "CONTENT-LENGTH: 5\r\n\r\n"
-              "hello");
+    const std::string header =
+        "PUT /files/test.txt HTTP/1.1\r\n"
+        "hOsT:\tlocalhost \t\r\n"
+        "CONTENT-LENGTH: 5\r\n\r\n";
+    const auto input = bytes(header + "he");
 
-    expectStatus(parser, input, ParseStatus::kComplete,
-                 "PUT should complete");
+    expectStatus(parser, input, ParseStatus::kHeadersComplete,
+                 "PUT headers should complete before its body");
     const HttpRequest* request = parser.request();
-    expect(request != nullptr, "PUT request is missing");
+    expect(request != nullptr, "PUT metadata is missing");
     expect(request->method == HttpMethod::kPut, "wrong PUT method");
     expect(request->content_length == 5U, "wrong PUT length");
     expect(request->headers.at("host") == "localhost",
            "Host normalization failed");
     expect(request->headers.at("content-length") == "5",
            "Content-Length normalization failed");
-    expect(std::string(request->body.begin(), request->body.end()) == "hello",
-           "wrong PUT body");
+    expect(parser.consumedBytes() == header.size(),
+           "parser consumed body bytes");
 }
 
-void testNormalDeleteAndHead() {
-    HttpParser delete_parser;
-    const auto delete_input =
-        bytes("DELETE /files/test.txt HTTP/1.1\r\n"
-              "Host: localhost\r\n\r\n");
-    expectStatus(delete_parser, delete_input, ParseStatus::kComplete,
-                 "DELETE should complete");
-    expect(delete_parser.request()->method == HttpMethod::kDelete,
-           "wrong DELETE method");
-
-    HttpParser head_parser;
-    const auto head_input =
-        bytes("HEAD /files/test.txt HTTP/1.1\r\n"
-              "Host: localhost\r\n\r\n");
-    expectStatus(head_parser, head_input, ParseStatus::kComplete,
-                 "HEAD should complete");
-    expect(head_parser.request()->method == HttpMethod::kHead,
-           "wrong HEAD method");
-}
-
-void testThreePartIncrementalPut() {
-    HttpParser parser;
-    std::vector<char> input;
-
-    append(input, "PUT /files/a.txt HTTP/1.1\r\nHo");
-    expectStatus(parser, input, ParseStatus::kIncomplete,
-                 "first fragment must be incomplete");
-
-    append(input, "st: localhost\r\nContent-Length: 5\r\n\r\nhe");
-    expectStatus(parser, input, ParseStatus::kIncomplete,
-                 "second fragment must be incomplete");
-
-    append(input, "llo");
-    expectStatus(parser, input, ParseStatus::kComplete,
-                 "third fragment must complete");
-    expect(parser.request()->body.size() == 5U,
-           "fragmented body size is wrong");
+void testBodyBytesDoNotAffectParserCompletion() {
+    const std::string header =
+        "PUT /files/a.txt HTTP/1.1\r\nHost: localhost\r\n"
+        "Content-Length: 5\r\n\r\n";
+    for (const std::string suffix : {"", "he", "hello", "helloEXTRA"}) {
+        HttpParser parser;
+        expect(parser.parse(header + suffix) == ParseStatus::kHeadersComplete,
+               "parser waited for or validated body bytes");
+        expect(parser.consumedBytes() == header.size(),
+               "parser consumed bytes beyond headers");
+    }
 }
 
 void testSplitHeaderTerminator() {
     HttpParser parser;
-    auto input =
-        bytes("GET /files/a.txt HTTP/1.1\r\n"
-              "Host: localhost\r\n\r");
-
+    auto input = bytes("GET /files/a.txt HTTP/1.1\r\n"
+                       "Host: localhost\r\n\r");
     expectStatus(parser, input, ParseStatus::kIncomplete,
                  "split terminator must be incomplete");
-    append(input, "\n");
-    expectStatus(parser, input, ParseStatus::kComplete,
+    append(input, "\nBODY");
+    expectStatus(parser, input, ParseStatus::kHeadersComplete,
                  "completed terminator must parse");
+    expect(parser.consumedBytes() + 4U == input.size(),
+           "body after split terminator was consumed");
+}
+
+void testDeleteAndHead() {
+    HttpParser delete_parser;
+    expect(delete_parser.parse(
+               "DELETE /files/test.txt HTTP/1.1\r\nHost: localhost\r\n\r\n") ==
+               ParseStatus::kHeadersComplete,
+           "DELETE headers should complete");
+    expect(delete_parser.request()->method == HttpMethod::kDelete,
+           "wrong DELETE method");
+
+    HttpParser head_parser;
+    expect(head_parser.parse(
+               "HEAD /files/test.txt HTTP/1.1\r\nHost: localhost\r\n\r\n") ==
+               ParseStatus::kHeadersComplete,
+           "HEAD headers should complete");
+    expect(head_parser.request()->method == HttpMethod::kHead,
+           "wrong HEAD method");
 }
 
 void testRequiredAndUnsupportedFields() {
@@ -158,33 +155,31 @@ void testContentLengthValidation() {
     expectError("PUT / HTTP/1.1\r\nHost: localhost\r\n"
                 "Content-Length: 184467440737095516160\r\n\r\n");
     expectError("GET / HTTP/1.1\r\nHost: localhost\r\n"
-                "Content-Length: 1\r\n\r\nx");
+                "Content-Length: 1\r\n\r\n");
 }
 
 void testDuplicateContentLengthRejected() {
     expectError("PUT / HTTP/1.1\r\nHost: localhost\r\n"
-                "Content-Length: 5\r\nContent-Length: 6\r\n\r\nhello");
+                "Content-Length: 5\r\nContent-Length: 6\r\n\r\n");
     expectError("PUT / HTTP/1.1\r\nHost: localhost\r\n"
-                "Content-Length: 5\r\ncontent-length: 5\r\n\r\nhello");
+                "Content-Length: 5\r\ncontent-length: 5\r\n\r\n");
 }
 
 void testRequestLineLimit() {
     std::string request = "GET /";
     request.append(HttpParser::kMaxRequestLineSize, 'a');
-
     HttpParser parser;
-    expectStatus(parser, bytes(request), ParseStatus::kError,
-                 "oversized request line must fail");
+    expect(parser.parse(request) == ParseStatus::kError,
+           "oversized request line must fail");
 }
 
 void testHeaderSectionLimit() {
     std::string request =
         "GET / HTTP/1.1\r\nHost: localhost\r\nX-Large: ";
     request.append(HttpParser::kMaxHeaderSectionSize, 'a');
-
     HttpParser parser;
-    expectStatus(parser, bytes(request), ParseStatus::kError,
-                 "oversized header section must fail");
+    expect(parser.parse(request) == ParseStatus::kError,
+           "oversized header section must fail");
 }
 
 void testHeaderCountLimit() {
@@ -195,39 +190,19 @@ void testHeaderCountLimit() {
     request += "\r\n";
 
     HttpParser parser;
-    expectStatus(parser, bytes(request), ParseStatus::kError,
-                 "too many headers must fail");
+    expect(parser.parse(request) == ParseStatus::kError,
+           "too many headers must fail");
 }
 
-void testBodyBoundaries() {
+void testZeroLengthPutMetadata() {
     HttpParser parser;
-    auto input =
-        bytes("PUT / HTTP/1.1\r\nHost: localhost\r\n"
-              "Content-Length: 5\r\n\r\nhe");
-
-    expectStatus(parser, input, ParseStatus::kIncomplete,
-                 "short body must be incomplete");
-    append(input, "llo");
-    expectStatus(parser, input, ParseStatus::kComplete,
-                 "exact body must complete");
-
-    HttpParser extra_parser;
-    const auto extra =
-        bytes("PUT / HTTP/1.1\r\nHost: localhost\r\n"
-              "Content-Length: 5\r\n\r\nhello!");
-    expectStatus(extra_parser, extra, ParseStatus::kError,
-                 "extra body bytes must fail");
-}
-
-void testZeroLengthPut() {
-    HttpParser parser;
-    const auto input =
-        bytes("PUT /empty HTTP/1.1\r\nHost: localhost\r\n"
-              "Content-Length: 0\r\n\r\n");
-    expectStatus(parser, input, ParseStatus::kComplete,
-                 "zero-length PUT should complete");
-    expect(parser.request()->body.empty(),
-           "zero-length PUT body must be empty");
+    expect(parser.parse(
+               "PUT /files/empty.txt HTTP/1.1\r\nHost: localhost\r\n"
+               "Content-Length: 0\r\n\r\n") ==
+               ParseStatus::kHeadersComplete,
+           "zero-length PUT headers should complete");
+    expect(parser.request()->content_length == 0U,
+           "zero-length PUT metadata is wrong");
 }
 
 struct TestCase {
@@ -239,21 +214,18 @@ struct TestCase {
 
 int main() {
     const std::vector<TestCase> tests{
-        {"normal GET", testNormalGet},
-        {"normal PUT and header normalization",
-         testNormalPutAndHeaderNormalization},
-        {"normal DELETE and HEAD", testNormalDeleteAndHead},
-        {"three-part incremental PUT", testThreePartIncrementalPut},
+        {"partial and complete GET headers", testPartialAndCompleteGetHeaders},
+        {"PUT metadata without body copy", testPutMetadataWithoutBodyCopy},
+        {"body bytes ignored by parser", testBodyBytesDoNotAffectParserCompletion},
         {"split header terminator", testSplitHeaderTerminator},
-        {"required and unsupported fields",
-         testRequiredAndUnsupportedFields},
+        {"DELETE and HEAD", testDeleteAndHead},
+        {"required and unsupported fields", testRequiredAndUnsupportedFields},
         {"Content-Length validation", testContentLengthValidation},
         {"duplicate Content-Length", testDuplicateContentLengthRejected},
         {"request-line limit", testRequestLineLimit},
         {"header-section limit", testHeaderSectionLimit},
         {"header-count limit", testHeaderCountLimit},
-        {"body boundaries", testBodyBoundaries},
-        {"zero-length PUT", testZeroLengthPut},
+        {"zero-length PUT metadata", testZeroLengthPutMetadata},
     };
 
     std::size_t passed = 0;

@@ -46,7 +46,8 @@ void closeFileDescriptor(int fd, const char* description) noexcept {
 }  // namespace
 
 // 保存监听端口；socket 和 epoll 资源延迟到 run() 中创建。
-Server::Server(std::uint16_t port) : port_(port) {}
+Server::Server(std::uint16_t port, FileService file_service)
+    : port_(port), file_service_(std::move(file_service)) {}
 
 // 先销毁所有 Connection，再释放 Server 自身拥有的系统资源。
 Server::~Server() {
@@ -226,58 +227,50 @@ void Server::acceptConnections() {
 
 // 将客户端事件交给对应 Connection，并处理 epoll 异常状态。
 void Server::handleClientEvent(Connection& connection, std::uint32_t events) {
-    // client_fd 在销毁 Connection 前保存，用于 epoll 操作和日志。
     const int client_fd = connection.fd();
 
     if ((events & EPOLLIN) != 0U) {
-        // read_status 区分暂时读空、对端关闭和真正读取错误。
         const Connection::ReadStatus read_status =
-            connection.readAvailableData();
+            connection.readAvailableData(file_service_);
+
+        if (connection.state() == Connection::State::kError) {
+            std::cerr << "Request processing error: fd=" << client_fd
+                      << ": " << connection.errorMessage() << std::endl;
+            closeClient(client_fd);
+            return;
+        }
+
+        if (connection.state() == Connection::State::kRequestComplete) {
+            const HttpRequest* request = connection.request();
+            if (request == nullptr) {
+                std::cerr << "Completed connection has no request: fd="
+                          << client_fd << std::endl;
+            } else {
+                std::cout << "Processed request:" << std::endl
+                          << "method=" << toString(request->method) << std::endl
+                          << "target=" << request->target << std::endl
+                          << "content_length=" << request->content_length
+                          << std::endl
+                          << "received_body="
+                          << connection.receivedBodyBytes() << std::endl;
+            }
+            closeClient(client_fd);
+            return;
+        }
+
         if (read_status != Connection::ReadStatus::kOpen ||
             !connection.isValid()) {
             closeClient(client_fd);
             return;
         }
 
-        // Parser 只读取 Connection 已累计的数据，不执行任何网络操作。
-        HttpParser& parser = connection.httpParser();
-        const ParseStatus parse_status =
-            parser.parse(connection.inputBuffer());
-
-        if (parse_status == ParseStatus::kIncomplete) {
-            std::cout << "Parser incomplete: fd=" << client_fd
-                      << ", buffered=" << connection.inputBuffer().size()
-                      << " bytes" << std::endl;
-        } else if (parse_status == ParseStatus::kError) {
-            std::cerr << "HTTP parse error: fd=" << client_fd
-                      << ": " << parser.errorMessage() << std::endl;
-            closeClient(client_fd);
-            return;
-        } else {
-            const HttpRequest* request = parser.request();
-            if (request == nullptr) {
-                std::cerr << "HTTP parser completed without a request: fd="
-                          << client_fd << std::endl;
-                closeClient(client_fd);
-                return;
-            }
-
-            std::cout << "Parsed request:" << std::endl
-                      << "method=" << toString(request->method) << std::endl
-                      << "target=" << request->target << std::endl
-                      << "content_length=" << request->content_length
-                      << std::endl
-                      << "body_size=" << request->body.size() << std::endl;
-            closeClient(client_fd);
-            return;
-        }
+        std::cout << "Request incomplete: fd=" << client_fd
+                  << ", unread=" << connection.readableSize()
+                  << " bytes" << std::endl;
     }
 
     if ((events & EPOLLERR) != 0U) {
-        // socket_error 接收内核记录的异步 socket 错误码。
         int socket_error = 0;
-
-        // error_length 提供并接收 SO_ERROR 值的长度。
         socklen_t error_length = sizeof(socket_error);
         if (::getsockopt(client_fd, SOL_SOCKET, SO_ERROR,
                          &socket_error, &error_length) == 0 &&

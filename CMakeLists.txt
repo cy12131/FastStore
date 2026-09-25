@@ -77,3 +77,26 @@ target_compile_options(file_service_test PRIVATE
 )
 
 add_test(NAME file_service_test COMMAND file_service_test)
+
+
+add_executable(streaming_upload_test
+    tests/streaming_upload_test.cpp
+    src/connection.cpp
+    src/file_service.cpp
+    src/http.cpp
+)
+
+target_compile_features(streaming_upload_test PRIVATE cxx_std_17)
+target_include_directories(streaming_upload_test PRIVATE
+    "${PROJECT_SOURCE_DIR}/include"
+)
+set_target_properties(streaming_upload_test PROPERTIES
+    CXX_EXTENSIONS OFF
+)
+target_compile_options(streaming_upload_test PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+)
+
+add_test(NAME streaming_upload_test COMMAND streaming_upload_test)

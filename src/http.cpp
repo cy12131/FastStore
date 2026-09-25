@@ -149,84 +149,47 @@ std::string_view toString(HttpMethod method) noexcept {
     return "UNKNOWN";
 }
 
-ParseStatus HttpParser::parse(const std::vector<char>& input) {
-    if (status_ == ParseStatus::kError) {
+ParseStatus HttpParser::parse(std::string_view input) {
+    if (status_ != ParseStatus::kIncomplete) {
+        return status_;
+    }
+    if (input.empty()) {
         return status_;
     }
 
-    if (status_ == ParseStatus::kComplete) {
-        if (input.size() == consumed_bytes_) {
-            return status_;
-        }
-        return fail("extra bytes after the single supported request");
-    }
-
-    if (input.size() > kMaxBufferedRequestSize) {
-        return fail("request exceeds the maximum buffered size");
-    }
-
-    if (!headers_parsed_) {
-        if (input.empty()) {
-            return ParseStatus::kIncomplete;
-        }
-
-        const std::string_view data{input.data(), input.size()};
-        const std::size_t request_line_end = data.find(kCrlf);
-        if (request_line_end == std::string_view::npos) {
-            if (input.size() > kMaxRequestLineSize) {
-                return fail("request line exceeds 8 KiB");
-            }
-        } else if (request_line_end > kMaxRequestLineSize) {
+    const std::size_t request_line_end = input.find(kCrlf);
+    if (request_line_end == std::string_view::npos) {
+        if (input.size() > kMaxRequestLineSize) {
             return fail("request line exceeds 8 KiB");
         }
+    } else if (request_line_end > kMaxRequestLineSize) {
+        return fail("request line exceeds 8 KiB");
+    }
 
-        const std::size_t header_terminator =
-            data.find(kHeaderTerminator);
-        if (header_terminator == std::string_view::npos) {
-            if (input.size() > kMaxHeaderSectionSize) {
-                return fail("header section exceeds 32 KiB");
-            }
-            return ParseStatus::kIncomplete;
-        }
-
-        const std::size_t header_size =
-            header_terminator + kHeaderTerminator.size();
-        if (header_size > kMaxHeaderSectionSize) {
+    const std::size_t header_terminator = input.find(kHeaderTerminator);
+    if (header_terminator == std::string_view::npos) {
+        if (input.size() > kMaxHeaderSectionSize) {
             return fail("header section exceeds 32 KiB");
         }
-
-        if (request_line_end == std::string_view::npos ||
-            request_line_end > header_terminator) {
-            return fail("request line is not terminated with CRLF");
-        }
-
-        const ParseStatus header_status =
-            parseHeaders(data, request_line_end,
-                         header_terminator, header_size);
-        if (header_status != ParseStatus::kIncomplete) {
-            return header_status;
-        }
+        return status_;
     }
 
-    if (input.size() < expected_request_size_) {
-        return ParseStatus::kIncomplete;
+    const std::size_t header_size =
+        header_terminator + kHeaderTerminator.size();
+    if (header_size > kMaxHeaderSectionSize) {
+        return fail("header section exceeds 32 KiB");
     }
-    if (input.size() > expected_request_size_) {
-        return fail("body exceeds Content-Length or contains pipelined data");
+    if (request_line_end == std::string_view::npos ||
+        request_line_end > header_terminator) {
+        return fail("request line is not terminated with CRLF");
     }
 
-    const auto body_begin =
-        input.begin() +
-        static_cast<std::vector<char>::difference_type>(header_size_);
-    request_->body.assign(body_begin, input.end());
-
-    consumed_bytes_ = expected_request_size_;
-    status_ = ParseStatus::kComplete;
-    return status_;
+    return parseHeaders(input, request_line_end,
+                        header_terminator, header_size);
 }
 
 const HttpRequest* HttpParser::request() const noexcept {
-    if (status_ != ParseStatus::kComplete || !request_.has_value()) {
+    if (status_ != ParseStatus::kHeadersComplete || !request_.has_value()) {
         return nullptr;
     }
     return &request_.value();
@@ -244,8 +207,7 @@ ParseStatus HttpParser::parseHeaders(std::string_view data,
                                      std::size_t request_line_end,
                                      std::size_t header_terminator,
                                      std::size_t header_size) {
-    const std::string_view request_line =
-        data.substr(0, request_line_end);
+    const std::string_view request_line = data.substr(0, request_line_end);
 
     const std::size_t first_space = request_line.find(' ');
     if (first_space == std::string_view::npos || first_space == 0U) {
@@ -262,8 +224,7 @@ ParseStatus HttpParser::parseHeaders(std::string_view data,
         return fail("malformed request line");
     }
 
-    const std::string_view method_text =
-        request_line.substr(0, first_space);
+    const std::string_view method_text = request_line.substr(0, first_space);
     const std::optional<HttpMethod> method = parseMethod(method_text);
     if (!method.has_value()) {
         return fail("unsupported HTTP method");
@@ -272,8 +233,7 @@ ParseStatus HttpParser::parseHeaders(std::string_view data,
     const std::string_view target =
         request_line.substr(first_space + 1U,
                             second_space - first_space - 1U);
-    const std::string_view version =
-        request_line.substr(second_space + 1U);
+    const std::string_view version = request_line.substr(second_space + 1U);
     if (target.empty()) {
         return fail("request target is empty");
     }
@@ -291,13 +251,11 @@ ParseStatus HttpParser::parseHeaders(std::string_view data,
     while (cursor < header_terminator) {
         const std::size_t line_end = data.find(kCrlf, cursor);
         if (line_end == std::string_view::npos ||
-            line_end > header_terminator ||
-            line_end == cursor) {
+            line_end > header_terminator || line_end == cursor) {
             return fail("malformed header line");
         }
 
-        const std::string_view line =
-            data.substr(cursor, line_end - cursor);
+        const std::string_view line = data.substr(cursor, line_end - cursor);
         const std::size_t colon = line.find(':');
         if (colon == std::string_view::npos || colon == 0U) {
             return fail("header name is empty or missing a colon");
@@ -333,17 +291,12 @@ ParseStatus HttpParser::parseHeaders(std::string_view data,
     if (host == request.headers.end() || host->second.empty()) {
         return fail("HTTP/1.1 requires a non-empty Host header");
     }
-
-    if (request.headers.find("transfer-encoding") !=
-        request.headers.end()) {
+    if (request.headers.find("transfer-encoding") != request.headers.end()) {
         return fail("Transfer-Encoding is not supported");
     }
 
-    const auto content_length =
-        request.headers.find("content-length");
-    const bool has_content_length =
-        content_length != request.headers.end();
-
+    const auto content_length = request.headers.find("content-length");
+    const bool has_content_length = content_length != request.headers.end();
     std::size_t parsed_content_length = 0;
     if (has_content_length) {
         std::string error;
@@ -366,12 +319,9 @@ ParseStatus HttpParser::parseHeaders(std::string_view data,
 
     request.content_length = parsed_content_length;
     request_ = std::move(request);
-    headers_parsed_ = true;
-    header_size_ = header_size;
-    expected_request_size_ = header_size_ + parsed_content_length;
-
-    // 成功解析 header 后仍返回 Incomplete，由 parse() 统一检查 body。
-    return ParseStatus::kIncomplete;
+    consumed_bytes_ = header_size;
+    status_ = ParseStatus::kHeadersComplete;
+    return status_;
 }
 
 ParseStatus HttpParser::fail(std::string message) {

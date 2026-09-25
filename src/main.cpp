@@ -59,9 +59,17 @@ int main() {
             data_directory, "data path is not a directory", error);
     }
 
+    auto file_service_result = faststore::openFileService(data_directory);
+    if (!file_service_result.ok()) {
+        std::cerr << "FastStore initialization failed: unable to open data "
+                     "directory safely (FileError="
+                  << static_cast<int>(file_service_result.error()) << ")\n";
+        return EXIT_FAILURE;
+    }
+
     try {
-        // server 唯一持有监听 socket、epoll fd 和所有客户端 fd。
-        faststore::Server server{port};
+        // Server 拥有 FileService、监听资源和所有客户端连接。
+        faststore::Server server{port, file_service_result.takeValue()};
         server.run();
     } catch (const std::exception& error) {
         // error 保存 Server 初始化或事件循环抛出的异常信息。
