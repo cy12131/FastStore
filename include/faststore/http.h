@@ -14,7 +14,8 @@ enum class HttpMethod {
     kGet,
     kPut,
     kDelete,
-    kHead
+    kHead,
+    kUnsupported
 };
 
 // 将方法枚举转换为日志使用的稳定文本。
@@ -39,6 +40,12 @@ enum class ParseStatus {
     kError
 };
 
+enum class HttpParseError {
+    kNone,
+    kBadRequest,
+    kPayloadTooLarge
+};
+
 // 针对单个 HTTP/1.1 请求 header 的有状态增量解析器。
 class HttpParser {
 public:
@@ -53,7 +60,8 @@ public:
     // 仅在状态为 kHeadersComplete 时返回请求元数据。
     [[nodiscard]] const HttpRequest* request() const noexcept;
 
-    // 返回最近一次解析错误；非错误状态下为空。
+    // 返回最近一次解析错误类型和说明。
+    [[nodiscard]] HttpParseError error() const noexcept;
     [[nodiscard]] const std::string& errorMessage() const noexcept;
 
     // 返回完整 header section 占用的输入字节数。
@@ -67,11 +75,14 @@ private:
                              std::size_t header_size);
 
     // 记录不可恢复的错误并统一切换到 kError。
-    ParseStatus fail(std::string message);
+    ParseStatus fail(
+        std::string message,
+        HttpParseError error = HttpParseError::kBadRequest);
 
     ParseStatus status_{ParseStatus::kIncomplete}; // 当前解析状态。
     std::size_t consumed_bytes_{0};                // Header section 字节数。
     std::optional<HttpRequest> request_;            // 已解析的请求元数据。
+    HttpParseError error_{HttpParseError::kNone};
     std::string error_message_;                    // 最近一次错误说明。
 };
 

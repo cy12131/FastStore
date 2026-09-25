@@ -14,7 +14,9 @@ add_executable(faststore
     src/connection.cpp
     src/file_service.cpp
     src/http.cpp
+    src/http_response.cpp
     src/main.cpp
+    src/router.cpp
     src/server.cpp
 )
 
@@ -84,6 +86,8 @@ add_executable(streaming_upload_test
     src/connection.cpp
     src/file_service.cpp
     src/http.cpp
+    src/http_response.cpp
+    src/router.cpp
 )
 
 target_compile_features(streaming_upload_test PRIVATE cxx_std_17)
@@ -100,3 +104,28 @@ target_compile_options(streaming_upload_test PRIVATE
 )
 
 add_test(NAME streaming_upload_test COMMAND streaming_upload_test)
+
+
+add_executable(http_response_test
+    tests/http_response_test.cpp
+    src/connection.cpp
+    src/file_service.cpp
+    src/http.cpp
+    src/http_response.cpp
+    src/router.cpp
+)
+
+target_compile_features(http_response_test PRIVATE cxx_std_17)
+target_include_directories(http_response_test PRIVATE
+    "${PROJECT_SOURCE_DIR}/include"
+)
+set_target_properties(http_response_test PROPERTIES
+    CXX_EXTENSIONS OFF
+)
+target_compile_options(http_response_test PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+)
+
+add_test(NAME http_response_test COMMAND http_response_test)

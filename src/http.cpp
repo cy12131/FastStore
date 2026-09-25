@@ -117,7 +117,7 @@ bool parseContentLength(std::string_view text,
     return true;
 }
 
-std::optional<HttpMethod> parseMethod(std::string_view method) noexcept {
+HttpMethod parseMethod(std::string_view method) noexcept {
     if (method == "GET") {
         return HttpMethod::kGet;
     }
@@ -130,7 +130,7 @@ std::optional<HttpMethod> parseMethod(std::string_view method) noexcept {
     if (method == "HEAD") {
         return HttpMethod::kHead;
     }
-    return std::nullopt;
+    return HttpMethod::kUnsupported;
 }
 
 }  // namespace
@@ -145,6 +145,8 @@ std::string_view toString(HttpMethod method) noexcept {
             return "DELETE";
         case HttpMethod::kHead:
             return "HEAD";
+        case HttpMethod::kUnsupported:
+            return "UNSUPPORTED";
     }
     return "UNKNOWN";
 }
@@ -195,6 +197,10 @@ const HttpRequest* HttpParser::request() const noexcept {
     return &request_.value();
 }
 
+HttpParseError HttpParser::error() const noexcept {
+    return error_;
+}
+
 const std::string& HttpParser::errorMessage() const noexcept {
     return error_message_;
 }
@@ -225,10 +231,12 @@ ParseStatus HttpParser::parseHeaders(std::string_view data,
     }
 
     const std::string_view method_text = request_line.substr(0, first_space);
-    const std::optional<HttpMethod> method = parseMethod(method_text);
-    if (!method.has_value()) {
-        return fail("unsupported HTTP method");
+    for (const char character : method_text) {
+        if (!isTokenCharacter(character)) {
+            return fail("HTTP method is not a valid token");
+        }
     }
+    const HttpMethod method = parseMethod(method_text);
 
     const std::string_view target =
         request_line.substr(first_space + 1U,
@@ -242,7 +250,7 @@ ParseStatus HttpParser::parseHeaders(std::string_view data,
     }
 
     HttpRequest request;
-    request.method = method.value();
+    request.method = method;
     request.target.assign(target);
     request.version.assign(version);
 
@@ -305,7 +313,8 @@ ParseStatus HttpParser::parseHeaders(std::string_view data,
             return fail(std::move(error));
         }
         if (parsed_content_length > kMaxBodySize) {
-            return fail("Content-Length exceeds 64 MiB");
+            return fail("Content-Length exceeds 64 MiB",
+                        HttpParseError::kPayloadTooLarge);
         }
     }
 
@@ -313,7 +322,8 @@ ParseStatus HttpParser::parseHeaders(std::string_view data,
         if (!has_content_length) {
             return fail("PUT requires Content-Length");
         }
-    } else if (has_content_length && parsed_content_length != 0U) {
+    } else if (request.method != HttpMethod::kUnsupported &&
+               has_content_length && parsed_content_length != 0U) {
         return fail("this method does not accept a request body");
     }
 
@@ -324,8 +334,10 @@ ParseStatus HttpParser::parseHeaders(std::string_view data,
     return status_;
 }
 
-ParseStatus HttpParser::fail(std::string message) {
+ParseStatus HttpParser::fail(std::string message,
+                             HttpParseError error) {
     status_ = ParseStatus::kError;
+    error_ = error;
     error_message_ = std::move(message);
     request_.reset();
     return status_;

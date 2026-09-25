@@ -243,7 +243,7 @@ void testMultiChunkUpload() {
            "final chunk failed");
 
     expect(harness.connection().state() ==
-               Connection::State::kRequestComplete,
+               Connection::State::kWritingResponse,
            "multi-chunk upload did not complete");
     expect(readFile(harness.data() / "multi.txt") == "abcdefghij",
            "multi-chunk content is wrong");
@@ -257,7 +257,7 @@ void testHeaderAndEntireBody() {
     expect(harness.pump() == Connection::ReadStatus::kOpen,
            "single-chunk upload failed");
     expect(harness.connection().state() ==
-               Connection::State::kRequestComplete,
+               Connection::State::kWritingResponse,
            "single-chunk upload did not complete");
     expect(readFile(harness.data() / "entire.txt") == "abcdefghij",
            "single-chunk content is wrong");
@@ -268,17 +268,17 @@ void testExtraBytesPreventCommit() {
     const auto data_path = harness.data();
     writeFile(data_path / "extra.txt", "ORIGINAL");
     harness.send(putHeader("extra.txt", 3U) + "abcXYZ");
-    expect(harness.pump() == Connection::ReadStatus::kError,
-           "already-read extra bytes should fail the request");
-    expect(harness.connection().state() == Connection::State::kError,
-           "extra bytes did not set error state");
+    expect(harness.pump() == Connection::ReadStatus::kOpen,
+           "already-read extra bytes should prepare an error response");
+    expect(harness.connection().state() == Connection::State::kWritingResponse,
+           "extra bytes did not prepare an error response");
     expect(readFile(data_path / "extra.txt") == "ORIGINAL",
            "extra bytes request modified final file");
-    expect(countTemporaryFiles(data_path) == 1U,
-           "failed upload temp should remain owned by Connection");
+    expect(countTemporaryFiles(data_path) == 0U,
+           "error response preparation did not clean upload temp");
     harness.destroyConnection();
     expect(countTemporaryFiles(data_path) == 0U,
-           "failed upload temp was not cleaned by Connection RAII");
+           "failed upload cleanup was not idempotent");
     expect(readFile(data_path / "extra.txt") == "ORIGINAL",
            "cleanup modified the original target");
 }
@@ -295,11 +295,11 @@ void testDisconnectMidUpload() {
            "unexpected EOF should fail upload");
     expect(!std::filesystem::exists(data_path / "partial.txt"),
            "disconnect committed a partial final file");
-    expect(countTemporaryFiles(data_path) == 1U,
-           "Connection should still own partial temp file");
+    expect(countTemporaryFiles(data_path) == 0U,
+           "transport failure did not clean partial temp file");
     harness.destroyConnection();
     expect(countTemporaryFiles(data_path) == 0U,
-           "disconnect temp was not cleaned by Connection RAII");
+           "disconnect cleanup was not idempotent");
 }
 
 void testZeroLengthBody() {
@@ -308,7 +308,7 @@ void testZeroLengthBody() {
     expect(harness.pump() == Connection::ReadStatus::kOpen,
            "zero body request failed");
     expect(harness.connection().state() ==
-               Connection::State::kRequestComplete,
+               Connection::State::kWritingResponse,
            "zero body request did not complete");
     expect(std::filesystem::file_size(harness.data() / "empty.txt") == 0U,
            "zero body request did not create an empty file");
@@ -317,8 +317,8 @@ void testZeroLengthBody() {
 void testZeroLengthExtraRejected() {
     Harness harness;
     harness.send(putHeader("zero-extra.txt", 0U) + "X");
-    expect(harness.pump() == Connection::ReadStatus::kError,
-           "extra byte after zero-length body should fail");
+    expect(harness.pump() == Connection::ReadStatus::kOpen,
+           "zero-length extra byte should prepare an error response");
     expect(!std::filesystem::exists(harness.data() / "zero-extra.txt"),
            "zero-length request committed before extra-byte check");
 }
@@ -326,20 +326,20 @@ void testZeroLengthExtraRejected() {
 void testBodylessRequestExtraRejected() {
     Harness harness;
     harness.send("GET /files/a.txt HTTP/1.1\r\nHost: localhost\r\n\r\nX");
-    expect(harness.pump() == Connection::ReadStatus::kError,
-           "extra byte after bodyless request should fail");
-    expect(harness.connection().state() == Connection::State::kError,
-           "bodyless extra byte did not set error state");
+    expect(harness.pump() == Connection::ReadStatus::kOpen,
+           "bodyless extra byte should prepare an error response");
+    expect(harness.connection().state() == Connection::State::kWritingResponse,
+           "bodyless extra byte did not prepare an error response");
 }
 
 void testInvalidTarget() {
     Harness harness;
     harness.send("PUT /files/a/b HTTP/1.1\r\nHost: localhost\r\n"
                  "Content-Length: 3\r\n\r\nabc");
-    expect(harness.pump() == Connection::ReadStatus::kError,
-           "invalid target should fail");
-    expect(harness.connection().state() == Connection::State::kError,
-           "invalid target did not set error state");
+    expect(harness.pump() == Connection::ReadStatus::kOpen,
+           "invalid target should prepare an error response");
+    expect(harness.connection().state() == Connection::State::kWritingResponse,
+           "invalid target did not prepare an error response");
     expect(countTemporaryFiles(harness.data()) == 0U,
            "invalid target created a temp file");
 }
@@ -363,7 +363,7 @@ void testLargeBoundedStreamingUpload() {
     }
 
     expect(harness.connection().state() ==
-               Connection::State::kRequestComplete,
+               Connection::State::kWritingResponse,
            "large upload did not complete");
     expect(std::filesystem::file_size(harness.data() / "large.bin") ==
                total_size,

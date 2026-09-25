@@ -11,6 +11,7 @@
 namespace {
 
 using faststore::HttpMethod;
+using faststore::HttpParseError;
 using faststore::HttpParser;
 using faststore::HttpRequest;
 using faststore::ParseStatus;
@@ -136,13 +137,24 @@ void testDeleteAndHead() {
 void testRequiredAndUnsupportedFields() {
     expectError("GET / HTTP/1.1\r\n\r\n");
     expectError("PUT / HTTP/1.1\r\nHost: localhost\r\n\r\n");
-    expectError("POST / HTTP/1.1\r\nHost: localhost\r\n\r\n");
     expectError("GET / HTTP/1.0\r\nHost: localhost\r\n\r\n");
     expectError("GET / HTTP/1.1 EXTRA\r\nHost: localhost\r\n\r\n");
+    expectError("G@T / HTTP/1.1\r\nHost: localhost\r\n\r\n");
     expectError("GET / HTTP/1.1\r\nBroken-Header\r\n\r\n");
     expectError("GET / HTTP/1.1\r\n: value\r\nHost: localhost\r\n\r\n");
     expectError("GET / HTTP/1.1\r\nHost: localhost\r\n"
                 "Transfer-Encoding: chunked\r\n\r\n");
+}
+
+void testUnsupportedMethodMetadata() {
+    HttpParser parser;
+    expect(parser.parse(
+               "POST /files/a.txt HTTP/1.1\r\nHost: localhost\r\n\r\n") ==
+               ParseStatus::kHeadersComplete,
+           "unknown valid method should reach routing");
+    expect(parser.request() != nullptr &&
+               parser.request()->method == HttpMethod::kUnsupported,
+           "unknown method metadata is wrong");
 }
 
 void testContentLengthValidation() {
@@ -150,8 +162,14 @@ void testContentLengthValidation() {
                 "Content-Length: abc\r\n\r\n");
     expectError("PUT / HTTP/1.1\r\nHost: localhost\r\n"
                 "Content-Length: -1\r\n\r\n");
-    expectError("PUT / HTTP/1.1\r\nHost: localhost\r\n"
-                "Content-Length: 67108865\r\n\r\n");
+    HttpParser too_large_parser;
+    expect(too_large_parser.parse(
+               "PUT / HTTP/1.1\r\nHost: localhost\r\n"
+               "Content-Length: 67108865\r\n\r\n") ==
+               ParseStatus::kError,
+           "oversized body should fail");
+    expect(too_large_parser.error() == HttpParseError::kPayloadTooLarge,
+           "oversized body should be classified for HTTP 413");
     expectError("PUT / HTTP/1.1\r\nHost: localhost\r\n"
                 "Content-Length: 184467440737095516160\r\n\r\n");
     expectError("GET / HTTP/1.1\r\nHost: localhost\r\n"
@@ -220,6 +238,7 @@ int main() {
         {"split header terminator", testSplitHeaderTerminator},
         {"DELETE and HEAD", testDeleteAndHead},
         {"required and unsupported fields", testRequiredAndUnsupportedFields},
+        {"unsupported method metadata", testUnsupportedMethodMetadata},
         {"Content-Length validation", testContentLengthValidation},
         {"duplicate Content-Length", testDuplicateContentLengthRejected},
         {"request-line limit", testRequestLineLimit},

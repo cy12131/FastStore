@@ -1,5 +1,7 @@
 #include "faststore/connection.h"
 
+#include "faststore/router.h"
+
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -11,25 +13,6 @@
 #include <utility>
 
 namespace faststore {
-namespace {
-
-constexpr std::string_view kFilesPrefix = "/files/";
-
-// M4-B 只接受 /files/{single-basename}，不进行 URL decoding。
-std::optional<std::string> extractPutFilename(std::string_view target) {
-    if (target.size() <= kFilesPrefix.size() ||
-        target.substr(0, kFilesPrefix.size()) != kFilesPrefix) {
-        return std::nullopt;
-    }
-
-    const std::string_view filename = target.substr(kFilesPrefix.size());
-    if (validateFilename(filename) != FileError::kNone) {
-        return std::nullopt;
-    }
-    return std::string{filename};
-}
-
-}  // namespace
 
 Connection::Connection(int client_fd) noexcept : client_fd_(client_fd) {}
 
@@ -45,6 +28,8 @@ Connection::Connection(Connection&& other) noexcept
       final_filename_(std::move(other.final_filename_)),
       expected_body_bytes_(std::exchange(other.expected_body_bytes_, 0)),
       received_body_bytes_(std::exchange(other.received_body_bytes_, 0)),
+      response_buffer_(std::move(other.response_buffer_)),
+      response_offset_(std::exchange(other.response_offset_, 0)),
       error_message_(std::move(other.error_message_)) {}
 
 Connection& Connection::operator=(Connection&& other) noexcept {
@@ -64,6 +49,8 @@ Connection& Connection::operator=(Connection&& other) noexcept {
     final_filename_ = std::move(other.final_filename_);
     expected_body_bytes_ = std::exchange(other.expected_body_bytes_, 0);
     received_body_bytes_ = std::exchange(other.received_body_bytes_, 0);
+    response_buffer_ = std::move(other.response_buffer_);
+    response_offset_ = std::exchange(other.response_offset_, 0);
     error_message_ = std::move(other.error_message_);
     return *this;
 }
@@ -98,6 +85,16 @@ Connection::State Connection::state() const noexcept {
     return state_;
 }
 
+bool Connection::wantsRead() const noexcept {
+    return state_ == State::kReadingHeaders ||
+           state_ == State::kRequestReady ||
+           state_ == State::kReceivingBody;
+}
+
+bool Connection::wantsWrite() const noexcept {
+    return state_ == State::kWritingResponse;
+}
+
 std::size_t Connection::readableSize() const noexcept {
     return input_buffer_.size() - read_offset_;
 }
@@ -108,6 +105,14 @@ std::size_t Connection::peakReadableBytes() const noexcept {
 
 std::size_t Connection::receivedBodyBytes() const noexcept {
     return received_body_bytes_;
+}
+
+std::size_t Connection::responseOffset() const noexcept {
+    return response_offset_;
+}
+
+std::size_t Connection::responseSize() const noexcept {
+    return response_buffer_.size();
 }
 
 const HttpRequest* Connection::request() const noexcept {
@@ -137,12 +142,12 @@ bool Connection::appendInput(const char* data, std::size_t size) {
 
     if (input_buffer_.size() > kMaxBufferedInput ||
         size > kMaxBufferedInput - input_buffer_.size()) {
-        return fail("connection input buffer limit exceeded");
+        prepareBadRequest();
+        return false;
     }
 
     input_buffer_.insert(input_buffer_.end(), data, data + size);
-    peak_readable_bytes_ =
-        std::max(peak_readable_bytes_, readableSize());
+    peak_readable_bytes_ = std::max(peak_readable_bytes_, readableSize());
     return true;
 }
 
@@ -169,12 +174,8 @@ void Connection::compactIfNeeded() {
 }
 
 bool Connection::processBufferedInput(FileService& file_service) {
-    if (state_ == State::kError) {
-        return false;
-    }
-    if (state_ == State::kRequestComplete) {
-        return readableSize() == 0U ||
-               fail("extra bytes after the single supported request");
+    if (!wantsRead()) {
+        return state_ != State::kError;
     }
 
     if (state_ == State::kReadingHeaders) {
@@ -183,31 +184,47 @@ bool Connection::processBufferedInput(FileService& file_service) {
             return true;
         }
         if (parse_status == ParseStatus::kError) {
-            return fail(http_parser_.errorMessage());
+            if (http_parser_.error() == HttpParseError::kPayloadTooLarge) {
+                prepareResponse(makeResponse(HttpStatus::kPayloadTooLarge));
+            } else {
+                prepareBadRequest();
+            }
+            return true;
         }
 
         const HttpRequest* parsed_request = http_parser_.request();
         if (parsed_request == nullptr) {
-            return fail("HTTP parser completed without request metadata");
-        }
-
-        consume(http_parser_.consumedBytes());
-        if (parsed_request->method != HttpMethod::kPut) {
-            if (readableSize() != 0U) {
-                return fail("extra bytes after bodyless request");
-            }
-            state_ = State::kRequestComplete;
+            prepareResponse(makeResponse(HttpStatus::kInternalServerError));
             return true;
         }
 
-        const auto filename = extractPutFilename(parsed_request->target);
+        consume(http_parser_.consumedBytes());
+        if (parsed_request->method == HttpMethod::kUnsupported) {
+            // The method is syntactically valid but unsupported. Respond 405
+            // immediately and close after sending; an unsupported body is not
+            // consumed or interpreted as another request.
+            prepareResponse(routeRequest(file_service, *parsed_request));
+            return true;
+        }
+        if (parsed_request->method != HttpMethod::kPut) {
+            if (readableSize() != 0U) {
+                prepareBadRequest();
+                return true;
+            }
+            state_ = State::kRequestReady;
+            return true;
+        }
+
+        const auto filename = extractFileName(parsed_request->target);
         if (!filename.has_value()) {
-            return fail("invalid PUT target");
+            prepareBadRequest();
+            return true;
         }
 
         auto upload_result = file_service.createTemp();
         if (!upload_result.ok()) {
-            return fail("unable to create temporary upload file");
+            prepareResponse(responseForFileError(upload_result.error()));
+            return true;
         }
 
         upload_.emplace(upload_result.takeValue());
@@ -216,6 +233,12 @@ bool Connection::processBufferedInput(FileService& file_service) {
         state_ = State::kReceivingBody;
     }
 
+    if (state_ == State::kRequestReady) {
+        if (readableSize() != 0U) {
+            prepareBadRequest();
+        }
+        return true;
+    }
     if (state_ != State::kReceivingBody) {
         return true;
     }
@@ -227,7 +250,8 @@ bool Connection::processBufferedInput(FileService& file_service) {
         const FileResult<void> write_result =
             upload_->writeAll(readableData().substr(0, body_bytes));
         if (!write_result.ok()) {
-            return fail("unable to write upload body");
+            prepareResponse(responseForFileError(write_result.error()));
+            return true;
         }
         consume(body_bytes);
         received_body_bytes_ += body_bytes;
@@ -235,16 +259,26 @@ bool Connection::processBufferedInput(FileService& file_service) {
 
     if (received_body_bytes_ == expected_body_bytes_ &&
         readableSize() != 0U) {
-        return fail("bytes received after Content-Length boundary");
+        prepareBadRequest();
     }
     return true;
 }
 
-bool Connection::finalizeAtReadBoundary(bool peer_eof) {
+bool Connection::finalizeAtReadBoundary(FileService& file_service,
+                                        bool peer_eof) {
+    if (state_ == State::kWritingResponse ||
+        state_ == State::kResponseComplete) {
+        return true;
+    }
     if (state_ == State::kReadingHeaders) {
         if (peer_eof) {
-            return fail("unexpected EOF while reading HTTP headers");
+            failTransport("unexpected EOF while reading HTTP headers");
+            return false;
         }
+        return true;
+    }
+    if (state_ == State::kRequestReady) {
+        prepareResponse(routeRequest(file_service, *http_parser_.request()));
         return true;
     }
     if (state_ != State::kReceivingBody) {
@@ -253,33 +287,48 @@ bool Connection::finalizeAtReadBoundary(bool peer_eof) {
 
     if (received_body_bytes_ != expected_body_bytes_) {
         if (peer_eof) {
-            return fail("unexpected EOF while receiving PUT body");
+            failTransport("unexpected EOF while receiving PUT body");
+            return false;
         }
         return true;
     }
     if (readableSize() != 0U) {
-        return fail("bytes received after Content-Length boundary");
+        prepareBadRequest();
+        return true;
     }
 
-    // Commit only after recv has reached EAGAIN/EOF, so bytes already read
-    // beyond Content-Length are rejected first. EAGAIN only means the receive
-    // queue is temporarily empty; it cannot prove that the peer will not send
-    // more bytes later. V0 completes and closes this one-request connection.
+    // Bytes already read beyond Content-Length are rejected before commit.
+    // EAGAIN only means the receive queue is temporarily empty; V0 completes
+    // this one request and closes after sending its response.
     const FileResult<void> commit_result = upload_->commit(final_filename_);
     if (!commit_result.ok()) {
-        return fail("unable to commit upload");
+        prepareResponse(responseForFileError(commit_result.error()));
+        return true;
     }
 
     upload_.reset();
-    state_ = State::kRequestComplete;
+    prepareResponse(routeRequest(file_service, *http_parser_.request()));
     return true;
 }
 
-bool Connection::fail(std::string message) {
+void Connection::prepareResponse(HttpResponse response) {
+    upload_.reset();
+    input_buffer_.clear();
+    read_offset_ = 0;
+    response_buffer_ = serializeHttpResponse(response);
+    response_offset_ = 0;
+    state_ = State::kWritingResponse;
+}
+
+void Connection::prepareBadRequest() {
+    prepareResponse(makeResponse(HttpStatus::kBadRequest));
+}
+
+void Connection::failTransport(std::string message) {
     state_ = State::kError;
     valid_ = false;
+    upload_.reset();
     error_message_ = std::move(message);
-    return false;
 }
 
 Connection::ReadStatus Connection::readAvailableData(
@@ -292,8 +341,10 @@ Connection::ReadStatus Connection::readAvailableData(
 
         if (bytes_received > 0) {
             const auto chunk_size = static_cast<std::size_t>(bytes_received);
-            if (!appendInput(read_buffer.data(), chunk_size) ||
-                !processBufferedInput(file_service)) {
+            if (!appendInput(read_buffer.data(), chunk_size)) {
+                return wantsWrite() ? ReadStatus::kOpen : ReadStatus::kError;
+            }
+            if (!processBufferedInput(file_service)) {
                 return ReadStatus::kError;
             }
 
@@ -301,14 +352,16 @@ Connection::ReadStatus Connection::readAvailableData(
                       << " bytes from fd=" << client_fd_
                       << ", unread buffer=" << readableSize()
                       << " bytes" << std::endl;
+            if (wantsWrite()) {
+                return ReadStatus::kOpen;
+            }
             continue;
         }
 
         if (bytes_received == 0) {
-            if (!finalizeAtReadBoundary(true)) {
+            if (!finalizeAtReadBoundary(file_service, true)) {
                 return ReadStatus::kError;
             }
-            valid_ = false;
             return ReadStatus::kPeerClosed;
         }
 
@@ -316,16 +369,46 @@ Connection::ReadStatus Connection::readAvailableData(
             continue;
         }
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            if (!finalizeAtReadBoundary(false)) {
+            if (!finalizeAtReadBoundary(file_service, false)) {
                 return ReadStatus::kError;
             }
             return ReadStatus::kOpen;
         }
 
         const int error = errno;
-        fail(std::string{"recv failed: "} + std::strerror(error));
+        failTransport(std::string{"recv failed: "} + std::strerror(error));
         return ReadStatus::kError;
     }
+}
+
+Connection::WriteStatus Connection::writeAvailableData() {
+    if (!wantsWrite()) {
+        failTransport("send requested without a pending response");
+        return WriteStatus::kError;
+    }
+
+    while (response_offset_ < response_buffer_.size()) {
+        const ssize_t sent = ::send(
+            client_fd_, response_buffer_.data() + response_offset_,
+            response_buffer_.size() - response_offset_, MSG_NOSIGNAL);
+        if (sent > 0) {
+            response_offset_ += static_cast<std::size_t>(sent);
+            continue;
+        }
+        if (sent == -1 && errno == EINTR) {
+            continue;
+        }
+        if (sent == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return WriteStatus::kPending;
+        }
+
+        const int error = sent == 0 ? EIO : errno;
+        failTransport(std::string{"send failed: "} + std::strerror(error));
+        return WriteStatus::kError;
+    }
+
+    state_ = State::kResponseComplete;
+    return WriteStatus::kComplete;
 }
 
 }  // namespace faststore

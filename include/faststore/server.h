@@ -29,6 +29,7 @@ private:
     void initializeEpoll();
     void acceptConnections();
     void handleClientEvent(Connection& connection, std::uint32_t events);
+    bool updateClientInterest(const Connection& connection);
     void closeClient(int client_fd);
 
     std::uint16_t port_;       // 服务器监听的主机字节序端口。

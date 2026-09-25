@@ -225,49 +225,9 @@ void Server::acceptConnections() {
     }
 }
 
-// 将客户端事件交给对应 Connection，并处理 epoll 异常状态。
+// 分发 EPOLLIN/EPOLLOUT；只有 Server 修改 epoll interest。
 void Server::handleClientEvent(Connection& connection, std::uint32_t events) {
     const int client_fd = connection.fd();
-
-    if ((events & EPOLLIN) != 0U) {
-        const Connection::ReadStatus read_status =
-            connection.readAvailableData(file_service_);
-
-        if (connection.state() == Connection::State::kError) {
-            std::cerr << "Request processing error: fd=" << client_fd
-                      << ": " << connection.errorMessage() << std::endl;
-            closeClient(client_fd);
-            return;
-        }
-
-        if (connection.state() == Connection::State::kRequestComplete) {
-            const HttpRequest* request = connection.request();
-            if (request == nullptr) {
-                std::cerr << "Completed connection has no request: fd="
-                          << client_fd << std::endl;
-            } else {
-                std::cout << "Processed request:" << std::endl
-                          << "method=" << toString(request->method) << std::endl
-                          << "target=" << request->target << std::endl
-                          << "content_length=" << request->content_length
-                          << std::endl
-                          << "received_body="
-                          << connection.receivedBodyBytes() << std::endl;
-            }
-            closeClient(client_fd);
-            return;
-        }
-
-        if (read_status != Connection::ReadStatus::kOpen ||
-            !connection.isValid()) {
-            closeClient(client_fd);
-            return;
-        }
-
-        std::cout << "Request incomplete: fd=" << client_fd
-                  << ", unread=" << connection.readableSize()
-                  << " bytes" << std::endl;
-    }
 
     if ((events & EPOLLERR) != 0U) {
         int socket_error = 0;
@@ -280,11 +240,79 @@ void Server::handleClientEvent(Connection& connection, std::uint32_t events) {
         } else {
             std::cerr << "Socket error on fd=" << client_fd << std::endl;
         }
+        closeClient(client_fd);
+        return;
     }
 
-    if ((events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) != 0U) {
+    if (connection.wantsRead() &&
+        (events & (EPOLLIN | EPOLLRDHUP)) != 0U) {
+        const Connection::ReadStatus read_status =
+            connection.readAvailableData(file_service_);
+
+        if (read_status == Connection::ReadStatus::kError ||
+            connection.state() == Connection::State::kError) {
+            std::cerr << "Connection processing error: fd=" << client_fd
+                      << ": " << connection.errorMessage() << std::endl;
+            closeClient(client_fd);
+            return;
+        }
+
+        if (connection.wantsWrite()) {
+            if (!updateClientInterest(connection)) {
+                closeClient(client_fd);
+                return;
+            }
+        } else if (read_status == Connection::ReadStatus::kPeerClosed) {
+            closeClient(client_fd);
+            return;
+        }
+    }
+
+    if (connection.wantsWrite()) {
+        // EPOLLRDHUP is only a peer write-half close. A response may still be
+        // sent; EPOLLHUP/EPOLLERR represent a fatal path handled separately.
+        if ((events & EPOLLHUP) != 0U) {
+            closeClient(client_fd);
+            return;
+        }
+        if ((events & EPOLLOUT) != 0U) {
+            const Connection::WriteStatus write_status =
+                connection.writeAvailableData();
+            if (write_status == Connection::WriteStatus::kError) {
+                std::cerr << "Response send error: fd=" << client_fd
+                          << ": " << connection.errorMessage() << std::endl;
+                closeClient(client_fd);
+                return;
+            }
+            if (write_status == Connection::WriteStatus::kComplete) {
+                std::cout << "Response sent: fd=" << client_fd << std::endl;
+                closeClient(client_fd);
+            }
+        }
+        return;
+    }
+
+    if (connection.state() == Connection::State::kResponseComplete ||
+        (events & (EPOLLHUP | EPOLLRDHUP)) != 0U) {
         closeClient(client_fd);
     }
+}
+
+// 在读取和响应发送阶段之间切换 LT epoll interest。
+bool Server::updateClientInterest(const Connection& connection) {
+    epoll_event event{};
+    event.events = (connection.wantsWrite() ? EPOLLOUT : EPOLLIN) |
+                   EPOLLRDHUP;
+    event.data.fd = connection.fd();
+    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD,
+                    connection.fd(), &event) == -1) {
+        const int error = errno;
+        std::cerr << "Failed to update epoll interest for fd="
+                  << connection.fd() << ": " << std::strerror(error)
+                  << std::endl;
+        return false;
+    }
+    return true;
 }
 
 // 先从 epoll 删除客户端，再销毁拥有该 fd 的 Connection。
