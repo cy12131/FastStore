@@ -1,5 +1,6 @@
 # CMake build directories and generated files
 /build/
+/build-*/
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
@@ -25,3 +26,8 @@ Testing/
 *.swp
 *.swo
 *~
+
+# Generated benchmark inputs and results
+/benchmarks/generated/
+/benchmarks/results/
+/data/faststore-bench-*

@@ -13,7 +13,8 @@ namespace faststore {
 class Server {
 public:
     // 接管 FileService；所有 Connection 的上传操作通过它访问 data/。
-    Server(std::uint16_t port, FileService file_service);
+    Server(std::uint16_t port, FileService file_service,
+           bool informational_logging_enabled = true);
     ~Server();
 
     Server(const Server&) = delete;
@@ -36,6 +37,7 @@ private:
     int listening_fd_{-1};     // 接收新连接的非阻塞 socket fd。
     int epoll_fd_{-1};         // epoll 实例的文件描述符。
     FileService file_service_; // 唯一管理 data directory fd。
+    bool informational_logging_enabled_; // 是否输出高频正常路径日志。
 
     // 以客户端 fd 为键，按值拥有每个 Connection。
     std::unordered_map<int, Connection> connections_;

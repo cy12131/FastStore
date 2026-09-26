@@ -46,7 +46,8 @@ public:
     static constexpr std::size_t kMaxBufferedInput =
         HttpParser::kMaxHeaderSectionSize + kReadChunkSize;
 
-    explicit Connection(int client_fd) noexcept;
+    explicit Connection(int client_fd,
+                        bool informational_logging_enabled = true) noexcept;
     ~Connection();
 
     Connection(const Connection&) = delete;
@@ -95,6 +96,7 @@ private:
     void closeClientFd() noexcept;
 
     int client_fd_;
+    bool informational_logging_enabled_;
     bool valid_{true};
     State state_{State::kReadingHeaders};
     std::vector<char> input_buffer_;

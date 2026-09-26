@@ -34,6 +34,12 @@ int main() {
     // data_directory 是构建时配置的文件数据目录绝对路径。
     const std::filesystem::path data_directory{FASTSTORE_DATA_DIRECTORY};
 
+    // quiet_environment 只在启动时读取一次；只有精确值 "1" 开启安静模式。
+    const char* quiet_environment = std::getenv("FASTSTORE_QUIET");
+    const bool informational_logging_enabled =
+        quiet_environment == nullptr ||
+        std::string_view{quiet_environment} != "1";
+
     std::cout << "FastStore starting\n";
     std::cout << "Data directory: " << data_directory << '\n';
 
@@ -69,7 +75,8 @@ int main() {
 
     try {
         // Server 拥有 FileService、监听资源和所有客户端连接。
-        faststore::Server server{port, file_service_result.takeValue()};
+        faststore::Server server{port, file_service_result.takeValue(),
+                                 informational_logging_enabled};
         server.run();
     } catch (const std::exception& error) {
         // error 保存 Server 初始化或事件循环抛出的异常信息。

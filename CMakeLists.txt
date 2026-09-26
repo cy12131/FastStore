@@ -153,3 +153,28 @@ target_compile_options(get_streaming_test PRIVATE
 )
 
 add_test(NAME get_streaming_test COMMAND get_streaming_test)
+
+add_executable(robustness_test
+    tests/robustness_test.cpp
+    src/connection.cpp
+    src/file_service.cpp
+    src/http.cpp
+    src/http_response.cpp
+    src/router.cpp
+    src/server.cpp
+)
+
+target_compile_features(robustness_test PRIVATE cxx_std_17)
+target_include_directories(robustness_test PRIVATE
+    "${PROJECT_SOURCE_DIR}/include"
+)
+set_target_properties(robustness_test PROPERTIES
+    CXX_EXTENSIONS OFF
+)
+target_compile_options(robustness_test PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+)
+
+add_test(NAME robustness_test COMMAND robustness_test)

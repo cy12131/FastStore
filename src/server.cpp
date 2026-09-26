@@ -46,8 +46,11 @@ void closeFileDescriptor(int fd, const char* description) noexcept {
 }  // namespace
 
 // 保存监听端口；socket 和 epoll 资源延迟到 run() 中创建。
-Server::Server(std::uint16_t port, FileService file_service)
-    : port_(port), file_service_(std::move(file_service)) {}
+Server::Server(std::uint16_t port, FileService file_service,
+               bool informational_logging_enabled)
+    : port_(port),
+      file_service_(std::move(file_service)),
+      informational_logging_enabled_(informational_logging_enabled) {}
 
 // 先销毁所有 Connection，再释放 Server 自身拥有的系统资源。
 Server::~Server() {
@@ -186,7 +189,7 @@ void Server::acceptConnections() {
         }
 
         // connection 立即接管 client_fd；异常退出时也会自动关闭它。
-        Connection connection{client_fd};
+        Connection connection{client_fd, informational_logging_enabled_};
 
         // connection_inserted 表示唯一所有权是否已移动到 map 中。
         const bool connection_inserted =
@@ -216,12 +219,14 @@ void Server::acceptConnections() {
         // address 指向转换成功的地址文本；失败时为 nullptr。
         const char* address = ::inet_ntop(AF_INET, &peer_address.sin_addr,
                                           peer_ip.data(), peer_ip.size());
-        std::cout << "Accepted connection: fd=" << client_fd;
-        if (address != nullptr) {
-            std::cout << " peer=" << address << ':'
-                      << ntohs(peer_address.sin_port);
+        if (informational_logging_enabled_) {
+            std::cout << "Accepted connection: fd=" << client_fd;
+            if (address != nullptr) {
+                std::cout << " peer=" << address << ':'
+                          << ntohs(peer_address.sin_port);
+            }
+            std::cout << std::endl;
         }
-        std::cout << std::endl;
     }
 }
 
@@ -285,7 +290,10 @@ void Server::handleClientEvent(Connection& connection, std::uint32_t events) {
                 return;
             }
             if (write_status == Connection::WriteStatus::kComplete) {
-                std::cout << "Response sent: fd=" << client_fd << std::endl;
+                if (informational_logging_enabled_) {
+                    std::cout << "Response sent: fd=" << client_fd
+                              << std::endl;
+                }
                 closeClient(client_fd);
             }
         }
@@ -333,7 +341,9 @@ void Server::closeClient(int client_fd) {
 
     // 销毁 Connection；其析构函数在这里关闭 client_fd。
     connections_.erase(connection_it);
-    std::cout << "Connection closed: fd=" << client_fd << std::endl;
+    if (informational_logging_enabled_) {
+        std::cout << "Connection closed: fd=" << client_fd << std::endl;
+    }
 }
 
 }  // namespace faststore

@@ -14,10 +14,14 @@
 
 namespace faststore {
 
-Connection::Connection(int client_fd) noexcept : client_fd_(client_fd) {}
+Connection::Connection(int client_fd,
+                       bool informational_logging_enabled) noexcept
+    : client_fd_(client_fd),
+      informational_logging_enabled_(informational_logging_enabled) {}
 
 Connection::Connection(Connection&& other) noexcept
     : client_fd_(std::exchange(other.client_fd_, -1)),
+      informational_logging_enabled_(other.informational_logging_enabled_),
       valid_(std::exchange(other.valid_, false)),
       state_(std::exchange(other.state_, State::kError)),
       input_buffer_(std::move(other.input_buffer_)),
@@ -48,6 +52,7 @@ Connection& Connection::operator=(Connection&& other) noexcept {
 
     closeClientFd();
     client_fd_ = std::exchange(other.client_fd_, -1);
+    informational_logging_enabled_ = other.informational_logging_enabled_;
     valid_ = std::exchange(other.valid_, false);
     state_ = std::exchange(other.state_, State::kError);
     input_buffer_ = std::move(other.input_buffer_);
@@ -414,10 +419,12 @@ Connection::ReadStatus Connection::readAvailableData(
                 return ReadStatus::kError;
             }
 
-            std::cout << "Received " << bytes_received
-                      << " bytes from fd=" << client_fd_
-                      << ", unread buffer=" << readableSize()
-                      << " bytes" << std::endl;
+            if (informational_logging_enabled_) {
+                std::cout << "Received " << bytes_received
+                          << " bytes from fd=" << client_fd_
+                          << ", unread buffer=" << readableSize()
+                          << " bytes" << std::endl;
+            }
             if (wantsWrite()) {
                 return ReadStatus::kOpen;
             }
