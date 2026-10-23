@@ -1,0 +1,19 @@
+[Unit]
+Description=FastStore File Server
+After=network.target
+
+[Service]
+Type=simple
+User=faststore
+Group=faststore
+WorkingDirectory=/var/lib/faststore
+ExecStart=/opt/faststore/bin/faststore
+Environment=FASTSTORE_PORT=8080
+Environment=FASTSTORE_DATA_DIR=/var/lib/faststore/data
+Environment=FASTSTORE_WORKERS=4
+Environment=FASTSTORE_QUIET=0
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
