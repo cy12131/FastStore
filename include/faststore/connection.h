@@ -35,6 +35,7 @@ public:
         kReadingHeaders,
         kRequestReady,
         kReceivingBody,
+        kWaitingForWorker,
         kWritingResponse,
         kWritingFileBody,
         kResponseComplete,
@@ -46,8 +47,11 @@ public:
     static constexpr std::size_t kMaxBufferedInput =
         HttpParser::kMaxHeaderSectionSize + kReadChunkSize;
 
-    explicit Connection(int client_fd,
-                        bool informational_logging_enabled = true) noexcept;
+    explicit Connection(
+        int client_fd,
+        bool informational_logging_enabled = true) noexcept;
+    Connection(int client_fd, std::uint64_t connection_id,
+               bool informational_logging_enabled) noexcept;
     ~Connection();
 
     Connection(const Connection&) = delete;
@@ -56,6 +60,7 @@ public:
     Connection& operator=(Connection&& other) noexcept;
 
     [[nodiscard]] int fd() const noexcept;
+    [[nodiscard]] std::uint64_t id() const noexcept;
     [[nodiscard]] bool isValid() const noexcept;
     [[nodiscard]] State state() const noexcept;
     [[nodiscard]] bool wantsRead() const noexcept;
@@ -73,6 +78,12 @@ public:
     [[nodiscard]] bool hasOpenReadFile() const noexcept;
     [[nodiscard]] const HttpRequest* request() const noexcept;
     [[nodiscard]] const std::string& errorMessage() const noexcept;
+
+    // 仅由 Reactor 调用：复制独立 request 并进入 worker 等待状态。
+    [[nodiscard]] std::optional<HttpRequest> beginWorkerDispatch();
+
+    // 仅由 Reactor 调用：接收 worker completion，恢复现有 response 流程。
+    [[nodiscard]] bool applyRouteResult(RouteResult result);
 
     // 每次 recv 后立即解析/消费输入；PUT body 直接写入临时文件。
     ReadStatus readAvailableData(FileService& file_service);
@@ -96,6 +107,7 @@ private:
     void closeClientFd() noexcept;
 
     int client_fd_;
+    std::uint64_t connection_id_;
     bool informational_logging_enabled_;
     bool valid_{true};
     State state_{State::kReadingHeaders};

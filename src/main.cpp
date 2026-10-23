@@ -1,10 +1,10 @@
+#include "faststore/config.h"
 #include "faststore/server.h"
 
 #include <cstdlib>
-#include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <iostream>
-#include <stdexcept>
 #include <string_view>
 #include <system_error>
 
@@ -28,59 +28,60 @@ int report_data_directory_error(const std::filesystem::path& path,
 
 // 程序入口：准备 data 目录，然后创建并启动 TCP Server。
 int main() {
-    // port 是 M1 阶段固定使用的 TCP 监听端口。
-    constexpr std::uint16_t port = 8080;
-
-    // data_directory 是构建时配置的文件数据目录绝对路径。
-    const std::filesystem::path data_directory{FASTSTORE_DATA_DIRECTORY};
-
-    // quiet_environment 只在启动时读取一次；只有精确值 "1" 开启安静模式。
-    const char* quiet_environment = std::getenv("FASTSTORE_QUIET");
-    const bool informational_logging_enabled =
-        quiet_environment == nullptr ||
-        std::string_view{quiet_environment} != "1";
-
-    std::cout << "FastStore starting\n";
-    std::cout << "Data directory: " << data_directory << '\n';
-
-    // error 接收 filesystem API 的错误，避免异常中断初始化流程。
-    std::error_code error;
-
-    // exists 表示配置的数据路径当前是否已经存在。
-    const bool exists = std::filesystem::exists(data_directory, error);
-    if (error) {
-        return report_data_directory_error(
-            data_directory, "unable to inspect data directory", error);
-    }
-
-    if (!exists) {
-        if (!std::filesystem::create_directories(data_directory, error)) {
-            return report_data_directory_error(
-                data_directory, "unable to create data directory", error);
-        }
-    }
-
-    if (!std::filesystem::is_directory(data_directory, error)) {
-        return report_data_directory_error(
-            data_directory, "data path is not a directory", error);
-    }
-
-    auto file_service_result = faststore::openFileService(data_directory);
-    if (!file_service_result.ok()) {
-        std::cerr << "FastStore initialization failed: unable to open data "
-                     "directory safely (FileError="
-                  << static_cast<int>(file_service_result.error()) << ")\n";
-        return EXIT_FAILURE;
-    }
-
     try {
-        // Server 拥有 FileService、监听资源和所有客户端连接。
-        faststore::Server server{port, file_service_result.takeValue(),
-                                 informational_logging_enabled};
+        // Config 只解析并校验；从这里开始才允许产生目录和网络副作用。
+        const faststore::ServerConfig config = faststore::loadServerConfig();
+
+        if (config.informational_logging_enabled) {
+            std::cout << "FastStore starting: port=" << config.port
+                      << " data=" << config.data_directory
+                      << " workers=" << config.worker_count
+                      << " quiet=false\n";
+        }
+
+        // error 接收 filesystem API 的错误，避免异常中断初始化流程。
+        std::error_code error;
+        const bool exists =
+            std::filesystem::exists(config.data_directory, error);
+        if (error) {
+            return report_data_directory_error(
+                config.data_directory,
+                "unable to inspect data directory", error);
+        }
+
+        if (!exists &&
+            !std::filesystem::create_directories(
+                config.data_directory, error)) {
+            return report_data_directory_error(
+                config.data_directory,
+                "unable to create data directory", error);
+        }
+
+        if (!std::filesystem::is_directory(
+                config.data_directory, error)) {
+            return report_data_directory_error(
+                config.data_directory,
+                "data path is not a directory", error);
+        }
+
+        auto file_service_result =
+            faststore::openFileService(config.data_directory);
+        if (!file_service_result.ok()) {
+            std::cerr << "FastStore initialization failed: unable to open "
+                         "data directory safely (FileError="
+                      << static_cast<int>(file_service_result.error())
+                      << ")\n";
+            return EXIT_FAILURE;
+        }
+
+        // Server 不读取环境变量，只接收已经验证的配置值。
+        faststore::Server server{
+            config.port, file_service_result.takeValue(),
+            config.worker_count, config.informational_logging_enabled};
         server.run();
     } catch (const std::exception& error) {
-        // error 保存 Server 初始化或事件循环抛出的异常信息。
-        std::cerr << "FastStore server failed: " << error.what() << '\n';
+        // 配置错误在创建目录、Server、listener socket 前到达这里。
+        std::cerr << "FastStore startup failed: " << error.what() << std::endl;
         return EXIT_FAILURE;
     }
 

@@ -2,6 +2,7 @@
 #define FASTSTORE_HTTP_H
 
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -52,7 +53,8 @@ public:
     static constexpr std::size_t kMaxRequestLineSize = 8U * 1024U;
     static constexpr std::size_t kMaxHeaderSectionSize = 32U * 1024U;
     static constexpr std::size_t kMaxHeaderCount = 100U;
-    static constexpr std::size_t kMaxBodySize = 64U * 1024U * 1024U;
+    static constexpr std::uint64_t kMaxUploadBytes =
+        1024ULL * 1024ULL * 1024ULL;
 
     // 解析 Connection 当前尚未消费的输入，header 完整后立即返回。
     ParseStatus parse(std::string_view input);

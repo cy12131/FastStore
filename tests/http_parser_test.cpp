@@ -162,10 +162,21 @@ void testContentLengthValidation() {
                 "Content-Length: abc\r\n\r\n");
     expectError("PUT / HTTP/1.1\r\nHost: localhost\r\n"
                 "Content-Length: -1\r\n\r\n");
+    HttpParser maximum_parser;
+    expect(maximum_parser.parse(
+               "PUT / HTTP/1.1\r\nHost: localhost\r\n"
+               "Content-Length: 1073741824\r\n\r\n") ==
+               ParseStatus::kHeadersComplete,
+           "exactly 1 GiB should be accepted by the protocol layer");
+    expect(maximum_parser.request() != nullptr &&
+               maximum_parser.request()->content_length ==
+                   HttpParser::kMaxUploadBytes,
+           "1 GiB Content-Length metadata is wrong");
+
     HttpParser too_large_parser;
     expect(too_large_parser.parse(
                "PUT / HTTP/1.1\r\nHost: localhost\r\n"
-               "Content-Length: 67108865\r\n\r\n") ==
+               "Content-Length: 1073741825\r\n\r\n") ==
                ParseStatus::kError,
            "oversized body should fail");
     expect(too_large_parser.error() == HttpParseError::kPayloadTooLarge,

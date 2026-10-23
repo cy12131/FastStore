@@ -14,13 +14,19 @@
 
 namespace faststore {
 
-Connection::Connection(int client_fd,
+Connection::Connection(
+    int client_fd, bool informational_logging_enabled) noexcept
+    : Connection(client_fd, 0, informational_logging_enabled) {}
+
+Connection::Connection(int client_fd, std::uint64_t connection_id,
                        bool informational_logging_enabled) noexcept
     : client_fd_(client_fd),
+      connection_id_(connection_id),
       informational_logging_enabled_(informational_logging_enabled) {}
 
 Connection::Connection(Connection&& other) noexcept
     : client_fd_(std::exchange(other.client_fd_, -1)),
+      connection_id_(std::exchange(other.connection_id_, 0)),
       informational_logging_enabled_(other.informational_logging_enabled_),
       valid_(std::exchange(other.valid_, false)),
       state_(std::exchange(other.state_, State::kError)),
@@ -52,6 +58,7 @@ Connection& Connection::operator=(Connection&& other) noexcept {
 
     closeClientFd();
     client_fd_ = std::exchange(other.client_fd_, -1);
+    connection_id_ = std::exchange(other.connection_id_, 0);
     informational_logging_enabled_ = other.informational_logging_enabled_;
     valid_ = std::exchange(other.valid_, false);
     state_ = std::exchange(other.state_, State::kError);
@@ -98,6 +105,10 @@ void Connection::closeClientFd() noexcept {
 
 int Connection::fd() const noexcept {
     return client_fd_;
+}
+
+std::uint64_t Connection::id() const noexcept {
+    return connection_id_;
 }
 
 bool Connection::isValid() const noexcept {
@@ -169,6 +180,25 @@ const HttpRequest* Connection::request() const noexcept {
 
 const std::string& Connection::errorMessage() const noexcept {
     return error_message_;
+}
+
+std::optional<HttpRequest> Connection::beginWorkerDispatch() {
+    if (state_ != State::kRequestReady || http_parser_.request() == nullptr) {
+        return std::nullopt;
+    }
+
+    // 先进入 waiting；即使 request copy 抛异常，Reactor 也能应用 500，
+    // 不会留下可被重复 dispatch 的 kRequestReady。
+    state_ = State::kWaitingForWorker;
+    return *http_parser_.request();
+}
+
+bool Connection::applyRouteResult(RouteResult result) {
+    if (state_ != State::kWaitingForWorker) {
+        return false;
+    }
+    prepareRouteResult(std::move(result));
+    return true;
 }
 
 std::string_view Connection::readableData() const noexcept {
@@ -312,7 +342,7 @@ bool Connection::processBufferedInput(FileService& file_service) {
     return true;
 }
 
-bool Connection::finalizeAtReadBoundary(FileService& file_service,
+bool Connection::finalizeAtReadBoundary(FileService&,
                                         bool peer_eof) {
     if (state_ == State::kWritingResponse ||
         state_ == State::kWritingFileBody ||
@@ -327,7 +357,6 @@ bool Connection::finalizeAtReadBoundary(FileService& file_service,
         return true;
     }
     if (state_ == State::kRequestReady) {
-        prepareRouteResult(routeRequest(file_service, *http_parser_.request()));
         return true;
     }
     if (state_ != State::kReceivingBody) {
@@ -356,7 +385,8 @@ bool Connection::finalizeAtReadBoundary(FileService& file_service,
     }
 
     upload_.reset();
-    prepareRouteResult(routeRequest(file_service, *http_parser_.request()));
+    // PUT body streaming 与 commit 仍在 Reactor；成功后直接准备原有 201。
+    prepareResponse(makeResponse(HttpStatus::kCreated));
     return true;
 }
 

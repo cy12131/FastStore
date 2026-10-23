@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.16)
 
 project(FastStore VERSION 0.1.0 LANGUAGES CXX)
 
+find_package(Threads REQUIRED)
+
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
     message(FATAL_ERROR "FastStore currently supports Linux only")
 endif()
@@ -11,6 +13,7 @@ if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
 endif()
 
 add_executable(faststore
+    src/config.cpp
     src/connection.cpp
     src/file_service.cpp
     src/http.cpp
@@ -18,6 +21,7 @@ add_executable(faststore
     src/main.cpp
     src/router.cpp
     src/server.cpp
+    src/thread_pool.cpp
 )
 
 target_compile_features(faststore PRIVATE cxx_std_17)
@@ -37,6 +41,7 @@ target_compile_options(faststore PRIVATE
 target_compile_definitions(faststore PRIVATE
     FASTSTORE_DATA_DIRECTORY="${PROJECT_SOURCE_DIR}/data"
 )
+target_link_libraries(faststore PRIVATE Threads::Threads)
 
 enable_testing()
 
@@ -162,6 +167,7 @@ add_executable(robustness_test
     src/http_response.cpp
     src/router.cpp
     src/server.cpp
+    src/thread_pool.cpp
 )
 
 target_compile_features(robustness_test PRIVATE cxx_std_17)
@@ -176,5 +182,51 @@ target_compile_options(robustness_test PRIVATE
     -Wextra
     -Wpedantic
 )
+target_link_libraries(robustness_test PRIVATE Threads::Threads)
 
 add_test(NAME robustness_test COMMAND robustness_test)
+
+add_executable(thread_pool_test
+    tests/thread_pool_test.cpp
+    src/thread_pool.cpp
+)
+
+target_compile_features(thread_pool_test PRIVATE cxx_std_17)
+target_include_directories(thread_pool_test PRIVATE
+    "${PROJECT_SOURCE_DIR}/include"
+)
+set_target_properties(thread_pool_test PROPERTIES
+    CXX_EXTENSIONS OFF
+)
+target_compile_options(thread_pool_test PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+)
+target_link_libraries(thread_pool_test PRIVATE Threads::Threads)
+
+add_test(NAME thread_pool_test COMMAND thread_pool_test)
+
+
+add_executable(config_test
+    tests/config_test.cpp
+    src/config.cpp
+)
+
+target_compile_features(config_test PRIVATE cxx_std_17)
+target_include_directories(config_test PRIVATE
+    "${PROJECT_SOURCE_DIR}/include"
+)
+set_target_properties(config_test PROPERTIES
+    CXX_EXTENSIONS OFF
+)
+target_compile_options(config_test PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+)
+target_compile_definitions(config_test PRIVATE
+    FASTSTORE_DATA_DIRECTORY="${PROJECT_SOURCE_DIR}/data"
+)
+
+add_test(NAME config_test COMMAND config_test)

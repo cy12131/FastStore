@@ -1,5 +1,6 @@
 #include "faststore/connection.h"
 #include "faststore/file_service.h"
+#include "faststore/router.h"
 
 #include <sys/socket.h>
 #include <unistd.h>
@@ -181,6 +182,13 @@ public:
         expect(connection_.readAvailableData(service_) ==
                    Connection::ReadStatus::kOpen,
                "request read failed");
+        if (connection_.state() == Connection::State::kRequestReady) {
+            auto parsed = connection_.beginWorkerDispatch();
+            expect(parsed.has_value(), "request was not available for dispatch");
+            expect(connection_.applyRouteResult(
+                       faststore::routeRequest(service_, parsed.value())),
+                   "route result was not accepted");
+        }
         expect(connection_.wantsWrite(), "request did not prepare output");
     }
 

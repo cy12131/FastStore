@@ -5,6 +5,7 @@
 
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <array>
@@ -181,7 +182,19 @@ public:
         if (peer_half_close) {
             sockets_.shutdownWrite();
         }
-        return connection_.readAvailableData(service_);
+        const Connection::ReadStatus status =
+            connection_.readAvailableData(service_);
+        if (connection_.state() == Connection::State::kRequestReady) {
+            auto parsed = connection_.beginWorkerDispatch();
+            expect(parsed.has_value(), "request was not available for dispatch");
+            expect(connection_.state() ==
+                       Connection::State::kWaitingForWorker,
+                   "dispatch did not enter worker-waiting state");
+            expect(connection_.applyRouteResult(
+                       faststore::routeRequest(service_, parsed.value())),
+                   "route result was not accepted");
+        }
+        return status;
     }
 
     std::string sendPreparedResponse() {
@@ -232,6 +245,59 @@ void testResponseSerialization() {
                "Content-Length: 0\r\n"
                "Connection: close\r\n\r\n",
            "response serialization is not exact CRLF HTTP/1.1");
+}
+
+void testFileListingResponse() {
+    Harness empty;
+    expect(empty.readRequest(
+               "GET /files HTTP/1.1\r\nHost: localhost\r\n\r\n") ==
+               Connection::ReadStatus::kOpen,
+           "empty listing request failed");
+    const std::string empty_response = empty.sendPreparedResponse();
+    const std::string empty_body = "{\"files\":[]}";
+    expectStatusLine(empty_response, "HTTP/1.1 200 OK\r\n");
+    expect(empty_response.find("Content-Type: application/json\r\n") !=
+               std::string::npos,
+           "listing response has the wrong Content-Type");
+    expect(empty_response.find("Content-Length: " +
+                               std::to_string(empty_body.size()) + "\r\n") !=
+               std::string::npos,
+           "empty listing response has the wrong Content-Length");
+    expect(empty_response.substr(empty_response.find("\r\n\r\n") + 4U) ==
+               empty_body,
+           "empty listing response has the wrong body");
+
+    Harness populated;
+    writeFile(populated.data() / "z.txt", "1234");
+    writeFile(populated.data() / "a\"quote\n.txt", "xy");
+    writeFile(populated.data() / ".faststore-upload-hidden", "partial");
+    expect(std::filesystem::create_directory(populated.data() / "directory"),
+           "unable to create listing directory fixture");
+    expect(::symlink((populated.data() / "z.txt").c_str(),
+                     (populated.data() / "symlink").c_str()) == 0,
+           "unable to create listing symlink fixture");
+    expect(::mkfifo((populated.data() / "fifo").c_str(), 0600) == 0,
+           "unable to create listing FIFO fixture");
+
+    expect(populated.readRequest(
+               "GET /files HTTP/1.1\r\nHost: localhost\r\n\r\n") ==
+               Connection::ReadStatus::kOpen,
+           "populated listing request failed");
+    const std::string response = populated.sendPreparedResponse();
+    const std::string body =
+        "{\"files\":[{\"name\":\"a\\\"quote\\n.txt\",\"size\":2},"
+        "{\"name\":\"z.txt\",\"size\":4}]}";
+    expectStatusLine(response, "HTTP/1.1 200 OK\r\n");
+    expect(response.find("Content-Type: application/json\r\n") !=
+               std::string::npos,
+           "listing response has the wrong Content-Type");
+    expect(response.find("Content-Length: " + std::to_string(body.size()) +
+                         "\r\n") != std::string::npos,
+           "listing response has the wrong Content-Length");
+    expect(response.substr(response.find("\r\n\r\n") + 4U) == body,
+           "listing JSON escaping, filtering, ordering, or sizes are wrong");
+    expect(!populated.connection().hasOpenReadFile(),
+           "listing incorrectly entered the streaming file pipeline");
 }
 
 void testPutCreated() {
@@ -318,7 +384,7 @@ void testRoutingErrors() {
     Harness too_large;
     too_large.readRequest(
         "PUT /files/large HTTP/1.1\r\nHost: localhost\r\n"
-        "Content-Length: 67108865\r\n\r\n");
+        "Content-Length: 1073741825\r\n\r\n");
     expectStatusLine(too_large.sendPreparedResponse(),
                      "HTTP/1.1 413 Payload Too Large\r\n");
 
@@ -414,6 +480,7 @@ struct TestCase {
 int main() {
     const std::vector<TestCase> tests{
         {"response serialization", testResponseSerialization},
+        {"file listing response", testFileListingResponse},
         {"PUT created", testPutCreated},
         {"HEAD existing and missing", testHeadExistingAndMissing},
         {"DELETE existing and missing", testDeleteExistingAndMissing},

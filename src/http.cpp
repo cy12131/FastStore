@@ -312,8 +312,8 @@ ParseStatus HttpParser::parseHeaders(std::string_view data,
                                 parsed_content_length, error)) {
             return fail(std::move(error));
         }
-        if (parsed_content_length > kMaxBodySize) {
-            return fail("Content-Length exceeds 64 MiB",
+        if (parsed_content_length > kMaxUploadBytes) {
+            return fail("Content-Length exceeds 1 GiB",
                         HttpParseError::kPayloadTooLarge);
         }
     }

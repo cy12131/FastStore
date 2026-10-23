@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
@@ -310,7 +311,7 @@ public:
                 ::_exit(2);
             }
             try {
-                Server server{port_, service_result.takeValue()};
+                Server server{port_, service_result.takeValue(), 4U};
                 server.run();
             } catch (...) {
                 ::_exit(3);
@@ -431,7 +432,7 @@ void testMalformedHttpAndUnsupportedMethod(const ServerProcess& server) {
         {std::move(oversized_line), "HTTP/1.1 400 Bad Request\r\n"},
         {std::move(oversized_headers), "HTTP/1.1 400 Bad Request\r\n"},
         {std::move(too_many_headers), "HTTP/1.1 400 Bad Request\r\n"},
-        {"PUT /files/large HTTP/1.1\r\nHost: x\r\nContent-Length: 67108865\r\n\r\n",
+        {"PUT /files/large HTTP/1.1\r\nHost: x\r\nContent-Length: 1073741825\r\n\r\n",
          "HTTP/1.1 413 Payload Too Large\r\n"},
         {"POST /files/known.txt HTTP/1.1\r\nHost: localhost\r\n\r\n",
          "HTTP/1.1 405 Method Not Allowed\r\n"},
@@ -622,6 +623,122 @@ void testCommittedFileSurvivesClientDrop(const ServerProcess& server,
     expectServerSurvives(server);
 }
 
+void testWorkerBackedRoutes(const ServerProcess& server,
+                            const TemporaryTree& tree) {
+    const std::string get_response = performRequest(
+        server.port(),
+        "GET /files/known.txt HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    expectStatus(get_response, "HTTP/1.1 200 OK\r\n");
+    expect(get_response.size() >= 13U &&
+               get_response.substr(get_response.size() - 13U) ==
+                   "known-content",
+           "worker-backed GET returned the wrong body");
+
+    expectStatus(performRequest(server.port(), headRequest("known.txt")),
+                 "HTTP/1.1 200 OK\r\n");
+
+    const std::string list_response = performRequest(
+        server.port(), "GET /files HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    expectStatus(list_response, "HTTP/1.1 200 OK\r\n");
+    expect(list_response.find("\"name\":\"known.txt\"") !=
+               std::string::npos,
+           "worker-backed listing omitted known.txt");
+
+    writeFile(tree.data() / "delete-by-worker.txt", "delete me");
+    expectStatus(performRequest(
+                     server.port(),
+                     "DELETE /files/delete-by-worker.txt HTTP/1.1\r\n"
+                     "Host: localhost\r\n\r\n"),
+                 "HTTP/1.1 204 No Content\r\n");
+    expect(!std::filesystem::exists(tree.data() / "delete-by-worker.txt"),
+           "worker-backed DELETE did not remove the file");
+
+    // FileService failure still returns a completion instead of leaving the
+    // Connection permanently in kWaitingForWorker.
+    expectStatus(performRequest(server.port(), headRequest("missing-worker")),
+                 "HTTP/1.1 404 Not Found\r\n");
+    expectServerSurvives(server);
+}
+
+void testConcurrentWorkerRequests(const ServerProcess& server) {
+    constexpr int client_count = 12;
+    constexpr int requests_per_client = 20;
+    std::atomic<bool> all_ok{true};
+    std::vector<std::thread> clients;
+    for (int client = 0; client < client_count; ++client) {
+        clients.emplace_back([&, client] {
+            try {
+                for (int request = 0; request < requests_per_client;
+                     ++request) {
+                    if ((client + request) % 2 == 0) {
+                        const std::string response = performRequest(
+                            server.port(),
+                            "GET /files/known.txt HTTP/1.1\r\nHost: x\r\n\r\n");
+                        if (response.rfind("HTTP/1.1 200 OK\r\n", 0) != 0U ||
+                            response.size() < 13U ||
+                            response.substr(response.size() - 13U) !=
+                                "known-content") {
+                            all_ok.store(false, std::memory_order_relaxed);
+                            return;
+                        }
+                    } else {
+                        const std::string response = performRequest(
+                            server.port(), headRequest("known.txt"));
+                        if (response.rfind("HTTP/1.1 200 OK\r\n", 0) != 0U) {
+                            all_ok.store(false, std::memory_order_relaxed);
+                            return;
+                        }
+                    }
+                }
+            } catch (...) {
+                all_ok.store(false, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (std::thread& client : clients) {
+        client.join();
+    }
+    expect(all_ok.load(std::memory_order_relaxed),
+           "concurrent worker-backed requests failed or hung");
+    expectServerSurvives(server);
+}
+
+void testWaitingWorkerDisconnect(const ServerProcess& server,
+                                 const TemporaryTree& tree) {
+    // Large listing makes reset-close overlap an outstanding worker task.
+    // Completion validation uses both fd and connection_id before applying.
+    constexpr int fixture_count = 1200;
+    for (int index = 0; index < fixture_count; ++index) {
+        writeFile(tree.data() /
+                      ("stale-fixture-" + std::to_string(index)),
+                  "x");
+    }
+
+    for (int cycle = 0; cycle < 12; ++cycle) {
+        sendAndDrop(server.port(),
+                    "GET /files HTTP/1.1\r\nHost: x\r\n\r\n", true);
+        expectStatus(performRequest(server.port(), headRequest("known.txt")),
+                     "HTTP/1.1 200 OK\r\n");
+    }
+
+    for (int index = 0; index < fixture_count; ++index) {
+        std::error_code error;
+        std::filesystem::remove(
+            tree.data() / ("stale-fixture-" + std::to_string(index)), error);
+        expect(!error, "unable to remove stale-result fixture");
+    }
+    expectServerSurvives(server);
+}
+
+void testServerConstructionShutdown(const std::filesystem::path& data_path) {
+    auto service_result = faststore::openFileService(data_path);
+    expect(service_result.ok(),
+           "shutdown test FileService initialization failed");
+    {
+        Server server{chooseLoopbackPort(), service_result.takeValue(), 2U};
+    }
+}
+
 struct TestCase {
     std::string_view name;
     std::function<void()> function;
@@ -643,8 +760,16 @@ int main() {
         expect(::mkfifo((tree.data() / "pipe").c_str(), 0600) == 0,
                "unable to create FIFO target");
 
+        testServerConstructionShutdown(tree.data());
+
         ServerProcess server{tree.data()};
         const std::vector<TestCase> tests{
+            {"worker-backed GET, HEAD, DELETE, list, and failure",
+             [&] { testWorkerBackedRoutes(server, tree); }},
+            {"concurrent worker-backed requests",
+             [&] { testConcurrentWorkerRequests(server); }},
+            {"waiting-worker disconnect and stale completion",
+             [&] { testWaitingWorkerDisconnect(server, tree); }},
             {"malformed HTTP and unsupported method",
              [&] { testMalformedHttpAndUnsupportedMethod(server); }},
             {"rejected targets",

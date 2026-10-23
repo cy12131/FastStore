@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -47,17 +48,24 @@ void closeFileDescriptor(int fd, const char* description) noexcept {
 
 // 保存监听端口；socket 和 epoll 资源延迟到 run() 中创建。
 Server::Server(std::uint16_t port, FileService file_service,
+               std::size_t worker_count,
                bool informational_logging_enabled)
     : port_(port),
       file_service_(std::move(file_service)),
-      informational_logging_enabled_(informational_logging_enabled) {}
+      informational_logging_enabled_(informational_logging_enabled),
+      thread_pool_(worker_count) {}
 
-// 先销毁所有 Connection，再释放 Server 自身拥有的系统资源。
+// 先停止 worker，再销毁 Connection 和 Server 系统资源。
 Server::~Server() {
+    // Worker task 仍可能使用 FileService、completion queue 和 eventfd。
+    // 先 drain/join 所有 worker，之后才销毁这些依赖资源。
+    thread_pool_.shutdown();
+
     // 清空容器会调用每个 Connection 的析构函数并关闭对应客户端 fd。
     connections_.clear();
 
     closeFileDescriptor(listening_fd_, "listening socket");
+    closeFileDescriptor(completion_event_fd_, "completion eventfd");
     closeFileDescriptor(epoll_fd_, "epoll");
 }
 
@@ -66,7 +74,9 @@ void Server::run() {
     initializeListeningSocket();
     initializeEpoll();
 
-    std::cout << "Listening on 0.0.0.0:" << port_ << std::endl;
+    if (informational_logging_enabled_) {
+        std::cout << "Listening on 0.0.0.0:" << port_ << std::endl;
+    }
 
     // ready_events 保存本轮 epoll_wait 返回的就绪事件。
     std::array<epoll_event, kMaxEvents> ready_events{};
@@ -99,6 +109,17 @@ void Server::run() {
                 if ((event.events & (EPOLLERR | EPOLLHUP)) != 0U) {
                     throw std::runtime_error(
                         "listening socket reported an error");
+                }
+                continue;
+            }
+
+            if (fd == completion_event_fd_) {
+                if ((event.events & EPOLLIN) != 0U) {
+                    handleWorkerCompletions();
+                }
+                if ((event.events & (EPOLLERR | EPOLLHUP)) != 0U) {
+                    throw std::runtime_error(
+                        "completion eventfd reported an error");
                 }
                 continue;
             }
@@ -157,6 +178,20 @@ void Server::initializeEpoll() {
     if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, listening_fd_, &event) == -1) {
         throwSystemError("epoll_ctl(ADD listening socket)");
     }
+
+    completion_event_fd_ =
+        ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (completion_event_fd_ == -1) {
+        throwSystemError("eventfd");
+    }
+
+    event = {};
+    event.events = EPOLLIN;
+    event.data.fd = completion_event_fd_;
+    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD,
+                    completion_event_fd_, &event) == -1) {
+        throwSystemError("epoll_ctl(ADD completion eventfd)");
+    }
 }
 
 // 循环接收监听队列中的连接，直到非阻塞 accept4 返回 EAGAIN。
@@ -189,7 +224,9 @@ void Server::acceptConnections() {
         }
 
         // connection 立即接管 client_fd；异常退出时也会自动关闭它。
-        Connection connection{client_fd, informational_logging_enabled_};
+        const std::uint64_t connection_id = next_connection_id_++;
+        Connection connection{client_fd, connection_id,
+                              informational_logging_enabled_};
 
         // connection_inserted 表示唯一所有权是否已移动到 map 中。
         const bool connection_inserted =
@@ -267,10 +304,24 @@ void Server::handleClientEvent(Connection& connection, std::uint32_t events) {
                 closeClient(client_fd);
                 return;
             }
+        } else if (connection.state() == Connection::State::kRequestReady) {
+            if (!dispatchRequest(connection) ||
+                !updateClientInterest(connection)) {
+                closeClient(client_fd);
+                return;
+            }
         } else if (read_status == Connection::ReadStatus::kPeerClosed) {
             closeClient(client_fd);
             return;
         }
+    }
+
+    if (connection.state() == Connection::State::kWaitingForWorker) {
+        // waiting 状态不监听 EPOLLOUT；EPOLLHUP/ERR 仍可关闭断开的 peer。
+        if ((events & EPOLLHUP) != 0U) {
+            closeClient(client_fd);
+        }
+        return;
     }
 
     if (connection.wantsWrite()) {
@@ -306,11 +357,148 @@ void Server::handleClientEvent(Connection& connection, std::uint32_t events) {
     }
 }
 
+bool Server::dispatchRequest(Connection& connection) {
+    const int client_fd = connection.fd();
+    const std::uint64_t connection_id = connection.id();
+
+    try {
+        std::optional<HttpRequest> request = connection.beginWorkerDispatch();
+        if (!request.has_value()) {
+            std::cerr << "Connection was not ready for worker dispatch: fd="
+                      << client_fd << std::endl;
+            return false;
+        }
+
+        // Worker 捕获独立 request、fd 和 generation，不捕获 Connection、
+        // map iterator 或 client object。Server 的生命周期由 shutdown/join
+        // 保证覆盖 task 对 FileService/completion resources 的访问。
+        thread_pool_.submit(
+            [this, request = std::move(request.value()),
+             client_fd, connection_id]() mutable {
+                RouteResult result{
+                    makeResponse(HttpStatus::kInternalServerError),
+                    std::nullopt};
+                try {
+                    result = routeRequest(file_service_, request);
+                } catch (const std::exception& error) {
+                    std::cerr << "Worker routing failed: "
+                              << error.what() << std::endl;
+                } catch (...) {
+                    std::cerr << "Worker routing failed: unknown exception"
+                              << std::endl;
+                }
+
+                publishCompletion(RouteCompletion{
+                    client_fd, connection_id, std::move(result)});
+            });
+        return true;
+    } catch (const std::exception& error) {
+        std::cerr << "Unable to dispatch request for fd=" << client_fd
+                  << ": " << error.what() << std::endl;
+    } catch (...) {
+        std::cerr << "Unable to dispatch request for fd=" << client_fd
+                  << ": unknown exception" << std::endl;
+    }
+
+    // beginWorkerDispatch() 先进入 waiting，因此 submit/copy 失败也能由
+    // Reactor 生成 500，不会让连接永久停在等待状态。
+    return connection.applyRouteResult(RouteResult{
+        makeResponse(HttpStatus::kInternalServerError), std::nullopt});
+}
+
+void Server::publishCompletion(RouteCompletion completion) {
+    {
+        std::lock_guard<std::mutex> lock{completion_mutex_};
+        completions_.push(std::move(completion));
+    }
+    notifyCompletion();
+}
+
+void Server::notifyCompletion() noexcept {
+    const std::uint64_t value = 1;
+    while (true) {
+        const ssize_t written = ::write(
+            completion_event_fd_, &value, sizeof(value));
+        if (written == static_cast<ssize_t>(sizeof(value))) {
+            return;
+        }
+        if (written == -1 && errno == EINTR) {
+            continue;
+        }
+        if (written == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            // counter 已饱和意味着 Reactor 已有未处理通知，无需重复唤醒。
+            return;
+        }
+        const int error = written == -1 ? errno : EIO;
+        std::cerr << "Failed to notify completion eventfd: "
+                  << std::strerror(error) << std::endl;
+        return;
+    }
+}
+
+void Server::drainCompletionEventFd() noexcept {
+    std::uint64_t value = 0;
+    while (true) {
+        const ssize_t count = ::read(
+            completion_event_fd_, &value, sizeof(value));
+        if (count == static_cast<ssize_t>(sizeof(value))) {
+            continue;
+        }
+        if (count == -1 && errno == EINTR) {
+            continue;
+        }
+        if (count == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return;
+        }
+        const int error = count == -1 ? errno : EIO;
+        std::cerr << "Failed to drain completion eventfd: "
+                  << std::strerror(error) << std::endl;
+        return;
+    }
+}
+
+void Server::handleWorkerCompletions() {
+    drainCompletionEventFd();
+
+    std::queue<RouteCompletion> local;
+    {
+        std::lock_guard<std::mutex> lock{completion_mutex_};
+        local.swap(completions_);
+    }
+
+    while (!local.empty()) {
+        RouteCompletion completion = std::move(local.front());
+        local.pop();
+
+        const auto connection_it = connections_.find(completion.client_fd);
+        if (connection_it == connections_.end() ||
+            connection_it->second.id() != completion.connection_id) {
+            // fd 可能已关闭并被 Linux 复用；generation 不匹配的结果过期。
+            continue;
+        }
+
+        Connection& connection = connection_it->second;
+        if (!connection.applyRouteResult(std::move(completion.result))) {
+            std::cerr << "Completion arrived for non-waiting connection: fd="
+                      << connection.fd() << std::endl;
+            closeClient(connection.fd());
+            continue;
+        }
+        if (!updateClientInterest(connection)) {
+            closeClient(connection.fd());
+        }
+    }
+}
+
 // 在读取和响应发送阶段之间切换 LT epoll interest。
 bool Server::updateClientInterest(const Connection& connection) {
     epoll_event event{};
-    event.events = (connection.wantsWrite() ? EPOLLOUT : EPOLLIN) |
-                   EPOLLRDHUP;
+    event.events = EPOLLRDHUP;
+    if (connection.wantsWrite()) {
+        event.events |= EPOLLOUT;
+    } else if (connection.wantsRead()) {
+        event.events |= EPOLLIN;
+    }
     event.data.fd = connection.fd();
     if (::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD,
                     connection.fd(), &event) == -1) {
