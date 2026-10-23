@@ -1,14 +1,78 @@
 #include "faststore/router.h"
 
+#include <string>
 #include <utility>
 
 namespace faststore {
 namespace {
 
 constexpr std::string_view kFilesPrefix = "/files/";
+constexpr std::string_view kFilesCollection = "/files";
 
 RouteResult responseOnly(HttpResponse response) {
     return RouteResult{std::move(response), std::nullopt};
+}
+
+void appendJsonString(std::string_view value, std::string& output) {
+    constexpr char hex[] = "0123456789abcdef";
+    output.push_back('"');
+    for (const unsigned char byte : value) {
+        switch (byte) {
+            case '"':
+                output += "\\\"";
+                break;
+            case '\\':
+                output += "\\\\";
+                break;
+            case '\b':
+                output += "\\b";
+                break;
+            case '\f':
+                output += "\\f";
+                break;
+            case '\n':
+                output += "\\n";
+                break;
+            case '\r':
+                output += "\\r";
+                break;
+            case '\t':
+                output += "\\t";
+                break;
+            default:
+                if (byte < 0x20U) {
+                    output += "\\u00";
+                    output.push_back(hex[byte >> 4U]);
+                    output.push_back(hex[byte & 0x0FU]);
+                } else {
+                    output.push_back(static_cast<char>(byte));
+                }
+                break;
+        }
+    }
+    output.push_back('"');
+}
+
+HttpResponse makeFileListResponse(const std::vector<FileEntry>& entries) {
+    std::string body{"{\"files\":["};
+    bool first = true;
+    for (const FileEntry& entry : entries) {
+        if (!first) {
+            body.push_back(',');
+        }
+        first = false;
+        body += "{\"name\":";
+        appendJsonString(entry.name, body);
+        body += ",\"size\":";
+        body += std::to_string(entry.size);
+        body.push_back('}');
+    }
+    body += "]}";
+
+    HttpResponse response = makeResponse(HttpStatus::kOk, body.size());
+    response.headers.emplace_back("Content-Type", "application/json");
+    response.body = std::move(body);
+    return response;
 }
 
 }  // namespace
@@ -47,6 +111,16 @@ HttpResponse responseForFileError(FileError error) {
 
 RouteResult routeRequest(FileService& file_service,
                          const HttpRequest& request) {
+    if (request.target == kFilesCollection &&
+        request.method == HttpMethod::kGet) {
+        auto listed = file_service.listFiles();
+        if (!listed.ok()) {
+            return responseOnly(
+                makeResponse(HttpStatus::kInternalServerError));
+        }
+        return responseOnly(makeFileListResponse(listed.value()));
+    }
+
     const auto filename = extractFileName(request.target);
     if (!filename.has_value()) {
         return responseOnly(makeResponse(HttpStatus::kBadRequest));

@@ -8,6 +8,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace faststore {
 
@@ -92,6 +93,11 @@ struct FileMetadata {
     std::uint64_t size{0};
 };
 
+struct FileEntry {
+    std::string name;
+    std::uint64_t size{0};
+};
+
 class FileService;
 
 class ReadFile {
@@ -155,6 +161,7 @@ public:
     FileService& operator=(FileService&& other) noexcept;
 
     FileResult<FileMetadata> metadata(std::string_view filename) const;
+    FileResult<std::vector<FileEntry>> listFiles() const;
     FileResult<ReadFile> openRead(std::string_view filename) const;
     FileResult<void> remove(std::string_view filename) const;
     FileResult<UploadFile> createTemp() const;

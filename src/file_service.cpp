@@ -1,5 +1,6 @@
 #include "faststore/file_service.h"
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <linux/fs.h>
 #include <sys/random.h>
@@ -8,6 +9,7 @@
 #include <unistd.h>
 
 #include <array>
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -381,6 +383,65 @@ FileResult<FileMetadata> FileService::metadata(
         return FileResult<FileMetadata>::failure(mapErrno(errno));
     }
     return metadataFromStat(status);
+}
+
+FileResult<std::vector<FileEntry>> FileService::listFiles() const {
+    // openat(".") 创建独立 open file description；普通 dup 会共享目录
+    // offset，多个 worker 并发 readdir 时会互相干扰。
+    const int enumeration_fd = ::openat(
+        directory_fd_, ".",
+        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (enumeration_fd == -1) {
+        return FileResult<std::vector<FileEntry>>::failure(mapErrno(errno));
+    }
+
+    DIR* directory = ::fdopendir(enumeration_fd);
+    if (directory == nullptr) {
+        const int error = errno;
+        int owned_fd = enumeration_fd;
+        closeOwnedFdNoexcept(owned_fd, "listing directory");
+        return FileResult<std::vector<FileEntry>>::failure(mapErrno(error));
+    }
+
+    std::vector<FileEntry> entries;
+    errno = 0;
+    while (dirent* entry = ::readdir(directory)) {
+        const std::string_view name{entry->d_name};
+        if (validateFilename(name) != FileError::kNone) {
+            errno = 0;
+            continue;
+        }
+
+        struct stat status {};
+        if (::fstatat(enumeration_fd, entry->d_name, &status,
+                      AT_SYMLINK_NOFOLLOW) == -1) {
+            const int error = errno;
+            ::closedir(directory);
+            return FileResult<std::vector<FileEntry>>::failure(
+                mapErrno(error));
+        }
+        if (S_ISREG(status.st_mode) && status.st_size >= 0) {
+            entries.push_back(FileEntry{
+                std::string{name},
+                static_cast<std::uint64_t>(status.st_size)});
+        }
+        errno = 0;
+    }
+
+    const int read_error = errno;
+    if (::closedir(directory) == -1 && read_error == 0) {
+        return FileResult<std::vector<FileEntry>>::failure(mapErrno(errno));
+    }
+    if (read_error != 0) {
+        return FileResult<std::vector<FileEntry>>::failure(
+            mapErrno(read_error));
+    }
+
+    std::sort(entries.begin(), entries.end(),
+              [](const FileEntry& left, const FileEntry& right) {
+                  return left.name < right.name;
+              });
+    return FileResult<std::vector<FileEntry>>::success(std::move(entries));
 }
 
 FileResult<ReadFile> FileService::openRead(

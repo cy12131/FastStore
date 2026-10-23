@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include <array>
+#include <atomic>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
@@ -12,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -211,6 +213,70 @@ void testSymlinkDirectoryAndFifoRejection() {
            "symlink itself should not be deleted");
 }
 
+void testFileListing() {
+    TemporaryTree empty_tree;
+    FileService empty_service = makeService(empty_tree.data());
+    const auto empty = empty_service.listFiles();
+    expect(empty.ok() && empty.value().empty(),
+           "empty directory should produce an empty listing");
+
+    TemporaryTree tree;
+    writeFile(tree.data() / "z-last.txt", "1234");
+    writeFile(tree.data() / "a-first.txt", "x");
+    writeFile(tree.data() / "quote\"and\ncontrol", "12");
+    writeFile(tree.data() / ".faststore-upload-hidden", "partial");
+    expect(std::filesystem::create_directory(tree.data() / "directory"),
+           "unable to create listed directory fixture");
+    expect(::symlink((tree.data() / "a-first.txt").c_str(),
+                     (tree.data() / "symlink").c_str()) == 0,
+           "unable to create listed symlink fixture");
+    expect(::mkfifo((tree.data() / "fifo").c_str(), 0600) == 0,
+           "unable to create listed FIFO fixture");
+
+    FileService service = makeService(tree.data());
+    const auto listed = service.listFiles();
+    expect(listed.ok(), "file listing failed");
+    const auto& entries = listed.value();
+    expect(entries.size() == 3U,
+           "listing included a non-regular or temporary entry");
+    expect(entries[0].name == "a-first.txt" && entries[0].size == 1U,
+           "first listed file or size is wrong");
+    expect(entries[1].name == "quote\"and\ncontrol" &&
+               entries[1].size == 2U,
+           "escaped-name file or size is wrong");
+    expect(entries[2].name == "z-last.txt" && entries[2].size == 4U,
+           "listing is not sorted lexicographically");
+
+    const auto listed_again = service.listFiles();
+    expect(listed_again.ok() && listed_again.value().size() == entries.size(),
+           "repeated listing did not restart at the first directory entry");
+
+    const auto metadata = service.metadata("a-first.txt");
+    expect(metadata.ok() && metadata.value().size == 1U,
+           "listing closed FileService's owned directory fd");
+
+    std::atomic<bool> concurrent_ok{true};
+    std::vector<std::thread> readers;
+    for (int worker = 0; worker < 8; ++worker) {
+        readers.emplace_back([&] {
+            for (int iteration = 0; iteration < 50; ++iteration) {
+                const auto concurrent = service.listFiles();
+                if (!concurrent.ok() || concurrent.value().size() != 3U ||
+                    concurrent.value()[0].name != "a-first.txt" ||
+                    concurrent.value()[2].name != "z-last.txt") {
+                    concurrent_ok.store(false, std::memory_order_relaxed);
+                    return;
+                }
+            }
+        });
+    }
+    for (std::thread& reader : readers) {
+        reader.join();
+    }
+    expect(concurrent_ok.load(std::memory_order_relaxed),
+           "concurrent listings shared or corrupted directory iteration");
+}
+
 void testUploadCommitAndOverwrite() {
     TemporaryTree tree;
     writeFile(tree.data() / "old.txt", "OLD");
@@ -361,6 +427,7 @@ int main() {
         {"metadata, read, and remove", testMetadataReadAndRemove},
         {"symlink, directory, and FIFO rejection",
          testSymlinkDirectoryAndFifoRejection},
+        {"file listing", testFileListing},
         {"upload commit and overwrite", testUploadCommitAndOverwrite},
         {"upload abort", testUploadAbort},
         {"upload destructor cleanup", testUploadDestructorCleanup},
